@@ -135,3 +135,73 @@ The initial implementation plan fixes the following choices:
 5. Consensus-layer signature prechecks are outside PQVM execution gas. The
    PQVM gas schedule prices in-VM validation and contract-visible PQ
    operations.
+
+## 10. PQVM-1.1 call and creation semantics
+
+The following decisions govern CALL, CREATE, and related opcodes, as
+implemented in the interpreter from version PQVM-1.1 onward.
+
+### 10.1 Contract address derivation
+
+**CREATE** — sender nonce derivation:
+```text
+new_address = BLAKE3(0x00 || sender_bytes || nonce_be8)[0:32]
+```
+
+**CREATE2** — salt/initcode derivation:
+```text
+initcode_hash = BLAKE3(initcode)
+new_address = BLAKE3(0xff || sender_bytes || salt_be32 || initcode_hash)[0:32]
+```
+
+Both use BLAKE3 as the domain-separated hash function throughout — no Keccak
+in the address derivation path.
+
+### 10.2 SSTORE gas tiers
+
+| Condition | Cost |
+|---|---:|
+| Slot is zero → nonzero (new) | 20,000 |
+| Slot is nonzero → different nonzero (update) | 2,900 |
+| Slot value unchanged (no-op) | 100 |
+
+No gas refund tracking in PQVM-1. Refunds may be specified in a future version.
+
+### 10.3 CALL gas forwarding (EIP-150 63/64 rule)
+
+```text
+forwarded = min(remaining * 63/64, gas_from_stack)
+stipend   = 2300 if value > 0 else 0
+sub_gas   = forwarded + stipend
+```
+
+Additional one-time costs when sending value:
+- `GAS_CALL_VALUE = 9,000` — charged on any value-sending CALL.
+- `GAS_CALL_NEW_ACCOUNT = 25,000` — charged only when the callee account does
+  not yet exist in state.
+
+### 10.4 SELFDESTRUCT non-destructive semantics
+
+`SELFDESTRUCT` transfers the entire balance of the current account to the
+target address and erases the caller account from state. It does **not** create
+historical debt or retain the account record. The opcode always terminates
+execution of the current frame after the transfer.
+
+### 10.5 Maximum call depth
+
+`MAX_CALL_DEPTH = 1024` — any CALL/CREATE attempted while depth ≥ 1024 pushes
+`0` on the caller's stack and returns empty returndata (same as revert at max
+depth in EVM).
+
+### 10.6 Transient storage (TLOAD/TSTORE)
+
+`TLOAD` and `TSTORE` are implemented as in-memory transient slots. Values do
+not persist across transactions (they are discarded at the end of each
+`execute_transaction` call). Gas: 100 per operation (same as a storage no-op).
+
+### 10.7 tx.data as calldata (not code)
+
+For CALL transactions (`to` is set), `tx.data` is passed as calldata to the
+callee. The code to execute comes from the callee account's `code` field in
+state. This separation ensures that transactions cannot inject code through the
+calldata field — account code is set only via CREATE/CREATE2 initcode.
