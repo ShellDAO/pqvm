@@ -1,6 +1,7 @@
 //! Public facade for the Shell-Chain Post-Quantum Virtual Machine.
 
 use alloy_primitives::U256;
+use precompiles::{PrecompileSet, ML_DSA_65_VERIFY, SLH_DSA_SHA2_256F_VERIFY};
 
 pub use pqvm_gas as gas;
 pub use pqvm_interpreter::{
@@ -39,6 +40,10 @@ pub enum TxExecutionError {
     NonceMismatch { expected: u64, got: u64 },
     #[error("sender balance {balance} is below value {value}")]
     InsufficientBalance { balance: U256, value: U256 },
+    #[error("transaction signature is invalid")]
+    InvalidSignature,
+    #[error("signature verification precompile failed: {0}")]
+    SignaturePrecompile(String),
     #[error(transparent)]
     State(#[from] StateError),
     #[error(transparent)]
@@ -64,12 +69,38 @@ pub fn execute_transaction(
     }
 
     let sender = derive_sender(tx)?;
+    verify_transaction_signature(tx)?;
     let checkpoint = state.checkpoint();
     ensure_sender_account(state, sender, tx)?;
     validate_sender_account(state, sender, tx)?;
 
     if let Some(to) = tx.to {
         state.transfer(sender, to, tx.value)?;
+    }
+
+    fn verify_transaction_signature(tx: &PQTx) -> Result<(), TxExecutionError> {
+        let public_key = tx
+            .public_key
+            .as_ref()
+            .ok_or(TxExecutionError::MissingPublicKey)?;
+        let precompile = match AlgoId::try_from(tx.sig_type)
+            .map_err(|_| TxExecutionError::UnknownSignatureAlgorithm(tx.sig_type))?
+        {
+            AlgoId::MlDsa65 => ML_DSA_65_VERIFY,
+            AlgoId::SlhDsaSha2256f => SLH_DSA_SHA2_256F_VERIFY,
+        };
+        let mut input = Vec::with_capacity(public_key.len() + tx.signature.len() + 32);
+        input.extend_from_slice(public_key);
+        input.extend_from_slice(&tx.signature);
+        input.extend_from_slice(tx.signing_payload().as_slice());
+        let output = precompiles::BasicPqPrecompiles
+            .execute(precompile, &input, u64::MAX)
+            .map_err(|err| TxExecutionError::SignaturePrecompile(err.to_string()))?
+            .ok_or_else(|| TxExecutionError::SignaturePrecompile("missing verifier".into()))?;
+        if output.output.first().copied() != Some(1) {
+            return Err(TxExecutionError::InvalidSignature);
+        }
+        Ok(())
     }
     state.increment_nonce(sender)?;
 
@@ -165,6 +196,8 @@ fn reference_pqaccount_code_hash(sig_type: u8, public_key: &[u8]) -> alloy_primi
 mod tests {
     use super::*;
     use alloy_primitives::Bytes;
+    use pqcrypto_dilithium::dilithium3;
+    use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
 
     fn env() -> Env {
         Env {
@@ -176,8 +209,9 @@ mod tests {
         }
     }
 
-    fn tx(public_key: &'static [u8], value: u64, data: &[u8]) -> PQTx {
-        PQTx {
+    fn tx_with_keypair(value: u64, data: &[u8]) -> PQTx {
+        let (pk, sk) = dilithium3::keypair();
+        let mut tx = PQTx {
             chain_id: 1,
             nonce: 0,
             max_fee: U256::ZERO,
@@ -186,15 +220,18 @@ mod tests {
             value: U256::from(value),
             data: Bytes::copy_from_slice(data),
             sig_type: AlgoId::MlDsa65 as u8,
-            public_key: Some(Bytes::from_static(public_key)),
-            signature: Bytes::from_static(b"signature"),
-        }
+            public_key: Some(Bytes::copy_from_slice(pk.as_bytes())),
+            signature: Bytes::new(),
+        };
+        let signature = dilithium3::detached_sign(tx.signing_payload().as_slice(), &sk);
+        tx.signature = Bytes::copy_from_slice(signature.as_bytes());
+        tx
     }
 
     #[test]
     fn execute_transaction_transfers_value_and_returns_receipt() {
         let mut state = PqvmState::default();
-        let tx = tx(b"public-key", 40, &[0x00]);
+        let tx = tx_with_keypair(40, &[0x00]);
         let sender = PQAddress::derive(tx.sig_type, tx.public_key.as_ref().unwrap());
         state.insert_account(
             sender,
@@ -220,7 +257,7 @@ mod tests {
     #[test]
     fn execute_transaction_initializes_first_use_account() {
         let mut state = PqvmState::default();
-        let tx = tx(b"new-key", 0, &[0x00]);
+        let tx = tx_with_keypair(0, &[0x00]);
         let sender = PQAddress::derive(tx.sig_type, tx.public_key.as_ref().unwrap());
 
         execute_transaction(&mut state, &env(), &tx).unwrap();
@@ -233,7 +270,7 @@ mod tests {
     #[test]
     fn execute_transaction_reverts_state_on_interpreter_error() {
         let mut state = PqvmState::default();
-        let tx = tx(b"public-key", 0, &[0xf2]);
+        let tx = tx_with_keypair(0, &[0xf2]);
         let sender = PQAddress::derive(tx.sig_type, tx.public_key.as_ref().unwrap());
         state.insert_account(
             sender,
@@ -250,5 +287,16 @@ mod tests {
             TxExecutionError::Interpreter(InterpreterError::RemovedOpcode("CALLCODE"))
         ));
         assert_eq!(state.account_ref(sender).unwrap().nonce, 0);
+    }
+
+    #[test]
+    fn execute_transaction_rejects_invalid_signature() {
+        let mut state = PqvmState::default();
+        let mut tx = tx_with_keypair(0, &[0x00]);
+        tx.signature = Bytes::from_static(b"invalid");
+
+        let err = execute_transaction(&mut state, &env(), &tx).unwrap_err();
+
+        assert!(matches!(err, TxExecutionError::InvalidSignature));
     }
 }

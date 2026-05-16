@@ -1181,6 +1181,8 @@ dependencies = [
  "alloy-primitives",
  "blake3",
  "hex",
+ "pqcrypto-dilithium",
+ "pqcrypto-traits",
  "pqvm-gas",
  "pqvm-interpreter",
  "pqvm-precompiles",
