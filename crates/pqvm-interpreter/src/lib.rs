@@ -48,6 +48,8 @@ pub enum InterpreterError {
     OutOfGas { required: u64, remaining: u64 },
     #[error("memory access overflows usize")]
     MemoryOverflow,
+    #[error("invalid jump destination: {0}")]
+    InvalidJump(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,13 +170,39 @@ pub fn opcode_info(opcode: u8) -> Option<OpcodeInfo> {
     let name = match opcode {
         0x00 => "STOP",
         0x01 => "ADD",
+        0x02 => "MUL",
+        0x03 => "SUB",
+        0x04 => "DIV",
+        0x06 => "MOD",
+        0x10 => "LT",
+        0x11 => "GT",
+        0x14 => "EQ",
+        0x15 => "ISZERO",
+        0x16 => "AND",
+        0x17 => "OR",
+        0x18 => "XOR",
+        0x19 => "NOT",
+        0x1b => "SHL",
+        0x1c => "SHR",
+        0x50 => "POP",
+        0x51 => "MLOAD",
+        0x52 => "MSTORE",
+        0x53 => "MSTORE8",
+        0x56 => "JUMP",
+        0x57 => "JUMPI",
+        0x58 => "PC",
+        0x59 => "MSIZE",
         0x5b => "JUMPDEST",
         0x5f => "PUSH0",
         0x60..=0x7f => "PUSH",
+        0x80..=0x8f => "DUP",
+        0x90..=0x9f => "SWAP",
+        0xf3 => "RETURN",
         0xb0 => "PQVERIFY",
         0xb1 => "PQHASH",
         0xb2 => "PQADDR",
         0xf2 => "CALLCODE",
+        0xfd => "REVERT",
         _ => return None,
     };
 
@@ -225,11 +253,70 @@ impl Interpreter {
                         output: Bytes::new(),
                     });
                 }
-                0x01 => {
-                    let a = self.pop()?;
-                    let b = self.pop()?;
-                    self.push(a.wrapping_add(b))?;
+                0x01 => self.binary_op(U256::wrapping_add)?,
+                0x02 => self.binary_op(U256::wrapping_mul)?,
+                0x03 => self.binary_op(|a, b| b.wrapping_sub(a))?,
+                0x04 => self.binary_op(|a, b| if a.is_zero() { U256::ZERO } else { b / a })?,
+                0x06 => self.binary_op(|a, b| if a.is_zero() { U256::ZERO } else { b % a })?,
+                0x10 => self.binary_op(|a, b| U256::from(b < a))?,
+                0x11 => self.binary_op(|a, b| U256::from(b > a))?,
+                0x14 => self.binary_op(|a, b| U256::from(a == b))?,
+                0x15 => {
+                    let value = self.pop()?;
+                    self.push(U256::from(value.is_zero()))?;
                 }
+                0x16 => self.binary_op(|a, b| a & b)?,
+                0x17 => self.binary_op(|a, b| a | b)?,
+                0x18 => self.binary_op(|a, b| a ^ b)?,
+                0x19 => {
+                    let value = self.pop()?;
+                    self.push(!value)?;
+                }
+                0x1b => self.binary_op(shift_left)?,
+                0x1c => self.binary_op(shift_right)?,
+                0x50 => {
+                    self.pop()?;
+                }
+                0x51 => {
+                    let offset = u256_to_usize(self.pop()?)?;
+                    let word = self.memory.load(offset, 32)?;
+                    let mut bytes = [0u8; 32];
+                    bytes.copy_from_slice(word);
+                    self.push(U256::from_be_bytes(bytes))?;
+                }
+                0x52 => {
+                    let offset = u256_to_usize(self.pop()?)?;
+                    let value = self.pop()?;
+                    let bytes = value.to_be_bytes::<32>();
+                    let memory_gas = self.memory.store(offset, &bytes)?;
+                    gas.charge(memory_gas)?;
+                }
+                0x53 => {
+                    let offset = u256_to_usize(self.pop()?)?;
+                    let value = self.pop()?;
+                    let byte = value.to_be_bytes::<32>()[31];
+                    let memory_gas = self.memory.store(offset, &[byte])?;
+                    gas.charge(memory_gas)?;
+                }
+                0x56 => {
+                    let dest = u256_to_usize(self.pop()?)?;
+                    if !bytecode.is_valid_jumpdest(dest) {
+                        return Err(InterpreterError::InvalidJump(dest));
+                    }
+                    pc = dest;
+                }
+                0x57 => {
+                    let dest = u256_to_usize(self.pop()?)?;
+                    let condition = self.pop()?;
+                    if !condition.is_zero() {
+                        if !bytecode.is_valid_jumpdest(dest) {
+                            return Err(InterpreterError::InvalidJump(dest));
+                        }
+                        pc = dest;
+                    }
+                }
+                0x58 => self.push(U256::from(pc - 1))?,
+                0x59 => self.push(U256::from(self.memory.len()))?,
                 0x5b => {}
                 0x5f => self.push(U256::ZERO)?,
                 0x60..=0x7f => {
@@ -245,7 +332,40 @@ impl Interpreter {
                     pc += len;
                     self.push(U256::from_be_bytes(word))?;
                 }
+                0x80..=0x8f => {
+                    let depth = (opcode - 0x7f) as usize;
+                    let value = self.peek(depth)?;
+                    self.push(value)?;
+                }
+                0x90..=0x9f => {
+                    let depth = (opcode - 0x8f) as usize;
+                    self.swap(depth)?;
+                }
                 0xf2 => return Err(InterpreterError::RemovedOpcode("CALLCODE")),
+                0xf3 => {
+                    let offset = u256_to_usize(self.pop()?)?;
+                    let len = u256_to_usize(self.pop()?)?;
+                    let memory_gas = self.memory.resize_for_access(offset, len)?;
+                    gas.charge(memory_gas)?;
+                    let output = Bytes::copy_from_slice(self.memory.load(offset, len)?);
+                    return Ok(ExecutionResult {
+                        status: ExecutionStatus::Success,
+                        gas_used: gas.used(),
+                        output,
+                    });
+                }
+                0xfd => {
+                    let offset = u256_to_usize(self.pop()?)?;
+                    let len = u256_to_usize(self.pop()?)?;
+                    let memory_gas = self.memory.resize_for_access(offset, len)?;
+                    gas.charge(memory_gas)?;
+                    let output = Bytes::copy_from_slice(self.memory.load(offset, len)?);
+                    return Ok(ExecutionResult {
+                        status: ExecutionStatus::Revert,
+                        gas_used: gas.used(),
+                        output,
+                    });
+                }
                 other => return Err(InterpreterError::UnsupportedOpcode(other)),
             }
         }
@@ -271,6 +391,39 @@ impl Interpreter {
 
     pub fn pop(&mut self) -> Result<U256, InterpreterError> {
         self.stack.pop().ok_or(InterpreterError::StackUnderflow)
+    }
+
+    fn peek(&self, depth: usize) -> Result<U256, InterpreterError> {
+        self.stack
+            .get(
+                self.stack
+                    .len()
+                    .checked_sub(depth)
+                    .ok_or(InterpreterError::StackUnderflow)?,
+            )
+            .copied()
+            .ok_or(InterpreterError::StackUnderflow)
+    }
+
+    fn swap(&mut self, depth: usize) -> Result<(), InterpreterError> {
+        let top = self
+            .stack
+            .len()
+            .checked_sub(1)
+            .ok_or(InterpreterError::StackUnderflow)?;
+        let other = self
+            .stack
+            .len()
+            .checked_sub(depth + 1)
+            .ok_or(InterpreterError::StackUnderflow)?;
+        self.stack.swap(top, other);
+        Ok(())
+    }
+
+    fn binary_op(&mut self, op: impl FnOnce(U256, U256) -> U256) -> Result<(), InterpreterError> {
+        let a = self.pop()?;
+        let b = self.pop()?;
+        self.push(op(a, b))
     }
 }
 
@@ -309,6 +462,29 @@ fn memory_expansion_cost(old_words: usize, new_words: usize) -> u64 {
 
 fn memory_cost(words: u64) -> u64 {
     MEMORY_LINEAR_GAS * words + words.saturating_mul(words) / MEMORY_QUAD_DENOMINATOR
+}
+
+fn shift_left(shift: U256, value: U256) -> U256 {
+    if shift >= U256::from(256) {
+        U256::ZERO
+    } else {
+        value << shift.to::<usize>()
+    }
+}
+
+fn shift_right(shift: U256, value: U256) -> U256 {
+    if shift >= U256::from(256) {
+        U256::ZERO
+    } else {
+        value >> shift.to::<usize>()
+    }
+}
+
+fn u256_to_usize(value: U256) -> Result<usize, InterpreterError> {
+    if value > U256::from(usize::MAX) {
+        return Err(InterpreterError::MemoryOverflow);
+    }
+    Ok(value.to::<usize>())
 }
 
 #[derive(Debug, Default)]
@@ -383,6 +559,141 @@ mod tests {
             .unwrap();
         assert_eq!(result.status, ExecutionStatus::Success);
         assert_eq!(interpreter.pop().unwrap(), U256::from(5));
+    }
+
+    #[test]
+    fn arithmetic_and_bitwise_opcodes_work() {
+        let mut db = EmptyDb;
+        let mut interpreter = Interpreter::default();
+        interpreter
+            .execute(
+                &mut db,
+                &env(),
+                &tx(&[
+                    0x60, 0x0f, // PUSH1 15
+                    0x60, 0x03, // PUSH1 3
+                    0x03, // SUB = 12
+                    0x60, 0x02, // PUSH1 2
+                    0x02, // MUL = 24
+                    0x60, 0x18, // PUSH1 24
+                    0x14, // EQ = 1
+                    0x60, 0x0f, // PUSH1 15
+                    0x16, // AND = 1
+                    0x00,
+                ]),
+            )
+            .unwrap();
+
+        assert_eq!(interpreter.pop().unwrap(), U256::from(1));
+    }
+
+    #[test]
+    fn dup_swap_and_pop_work() {
+        let mut db = EmptyDb;
+        let mut interpreter = Interpreter::default();
+        interpreter
+            .execute(
+                &mut db,
+                &env(),
+                &tx(&[
+                    0x60, 0x01, // PUSH1 1
+                    0x60, 0x02, // PUSH1 2
+                    0x80, // DUP1 -> 1,2,2
+                    0x90, // SWAP1 -> 1,2,2
+                    0x50, // POP -> 1,2
+                    0x00,
+                ]),
+            )
+            .unwrap();
+
+        assert_eq!(interpreter.pop().unwrap(), U256::from(2));
+        assert_eq!(interpreter.pop().unwrap(), U256::from(1));
+    }
+
+    #[test]
+    fn memory_store_load_and_return_work() {
+        let mut db = EmptyDb;
+        let mut interpreter = Interpreter::default();
+        let result = interpreter
+            .execute(
+                &mut db,
+                &env(),
+                &tx(&[
+                    0x60, 0x2a, // PUSH1 42
+                    0x60, 0x00, // PUSH1 offset 0
+                    0x52, // MSTORE
+                    0x60, 0x20, // PUSH1 len 32
+                    0x60, 0x00, // PUSH1 offset 0
+                    0xf3, // RETURN
+                ]),
+            )
+            .unwrap();
+
+        assert_eq!(result.status, ExecutionStatus::Success);
+        assert_eq!(result.output.len(), 32);
+        assert_eq!(result.output[31], 0x2a);
+    }
+
+    #[test]
+    fn jump_and_jumpi_validate_jumpdest() {
+        let mut db = EmptyDb;
+        let mut interpreter = Interpreter::default();
+        interpreter
+            .execute(
+                &mut db,
+                &env(),
+                &tx(&[
+                    0x60, 0x05, // PUSH1 dest
+                    0x56, // JUMP
+                    0x00, // skipped
+                    0x00, // skipped
+                    0x5b, // JUMPDEST
+                    0x60, 0x01, // PUSH1 1
+                    0x60, 0x0c, // PUSH1 dest
+                    0x57, // JUMPI
+                    0x00, // skipped
+                    0x5b, // JUMPDEST
+                    0x60, 0x2a, // PUSH1 42
+                    0x00,
+                ]),
+            )
+            .unwrap();
+
+        assert_eq!(interpreter.pop().unwrap(), U256::from(42));
+    }
+
+    #[test]
+    fn invalid_jump_is_rejected() {
+        let mut db = EmptyDb;
+        let mut interpreter = Interpreter::default();
+        let err = interpreter
+            .execute(&mut db, &env(), &tx(&[0x60, 0x03, 0x56, 0x00]))
+            .unwrap_err();
+
+        assert!(matches!(err, InterpreterError::InvalidJump(3)));
+    }
+
+    #[test]
+    fn revert_returns_output_with_revert_status() {
+        let mut db = EmptyDb;
+        let mut interpreter = Interpreter::default();
+        let result = interpreter
+            .execute(
+                &mut db,
+                &env(),
+                &tx(&[
+                    0x60, 0xee, // PUSH1 0xee
+                    0x60, 0x00, // PUSH1 offset 0
+                    0x53, // MSTORE8
+                    0x60, 0x01, // PUSH1 len 1
+                    0x60, 0x00, // PUSH1 offset 0
+                    0xfd, // REVERT
+                ]),
+            )
+            .unwrap();
+
+        assert_eq!(result.status, ExecutionStatus::Revert);
+        assert_eq!(result.output.as_ref(), &[0xee]);
     }
 
     #[test]
