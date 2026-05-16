@@ -35,6 +35,12 @@ Account = {
 Transaction validity is determined by account code, normally through a
 `validateSignature()` entrypoint. The reference `PQAccount` contract validates
 ML-DSA-65 and SLH-DSA-SHA2-256f signatures through the native precompile suite.
+On first use, an empty sender address is initialized with the reference
+`PQAccount` code hash after the transaction signature is validated against the
+supplied public key; subsequent transactions call the installed account's
+`validateSignature()` entrypoint. This preserves the invariant that all live
+accounts are code accounts while still supporting first-use public-key
+registration.
 
 ## 3. Transaction model
 
@@ -82,6 +88,8 @@ PQVM removes the classical Ethereum cryptographic surface:
 - No BN256 precompiles.
 - No standard Ethereum precompile table by default.
 - `SELFDESTRUCT` has no destructive mode.
+- No `CALLCODE`; `DELEGATECALL` covers the remaining legitimate library-call
+  use case without preserving the obsolete legacy opcode.
 
 ## 6. New PQ opcodes
 
@@ -113,15 +121,17 @@ address form.
 - `50,000,000 / 67,000 ~= 746`, so the 500-transaction hard cap binds before
   gas for homogeneous simple-transfer blocks.
 
-## 9. Open specification checks
+## 9. Specification decisions
 
-These items require implementation-driven review before PQVM-1 is frozen:
+The initial implementation plan fixes the following choices:
 
-1. Whether `KECCAK256` remains mandatory or becomes a compatibility feature.
-2. Whether `CALLCODE` should be retained despite its legacy semantics.
-3. Whether `PQVERIFY` should return `0/1` or trap with structured errors.
-4. Whether first-use direct verification conflicts with "all accounts are code
-   accounts" or should be modeled as reference `PQAccount` deployment.
-5. Whether Shell-Chain consensus-layer signature prechecks are outside PQVM gas
-   or charged through PQVM transaction validation.
-
+1. `KECCAK256` remains mandatory for Solidity storage-slot compatibility, but
+   it is not a Shell-Chain security primitive.
+2. `CALLCODE` is removed.
+3. `PQVERIFY` returns `1` for valid and `0` for invalid/error. Malformed input
+   does not trap unless a future gas-safety rule requires it.
+4. First-use accounts are initialized as reference `PQAccount` code accounts
+   after signature validation, rather than existing as EOAs.
+5. Consensus-layer signature prechecks are outside PQVM execution gas. The
+   PQVM gas schedule prices in-VM validation and contract-visible PQ
+   operations.
