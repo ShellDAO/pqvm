@@ -13,3 +13,7 @@ pqvm-primitives.workspace = true
 pqvm-state.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+blake3.workspace = true
+pqcrypto-dilithium.workspace = true
+pqcrypto-traits.workspace = true

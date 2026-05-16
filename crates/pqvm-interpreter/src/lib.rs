@@ -1,6 +1,11 @@
 //! PQVM interpreter scaffold.
 
 use alloy_primitives::{Bytes, U256};
+use pqvm_gas::{PQADDR_OPCODE, PQHASH_OPCODE, PQVERIFY_OPCODE};
+use pqvm_precompiles::{
+    BasicPqPrecompiles, PrecompileSet, BLAKE3_256, ML_DSA_65_VERIFY, PQADDRESS_DERIVE,
+    SLH_DSA_SHA2_256F_VERIFY,
+};
 use pqvm_primitives::{PQAddress, PQTx};
 use pqvm_state::PqvmDatabase;
 use std::collections::BTreeSet;
@@ -50,6 +55,8 @@ pub enum InterpreterError {
     MemoryOverflow,
     #[error("invalid jump destination: {0}")]
     InvalidJump(usize),
+    #[error("precompile execution failed: {0}")]
+    Precompile(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -341,6 +348,66 @@ impl Interpreter {
                     let depth = (opcode - 0x8f) as usize;
                     self.swap(depth)?;
                 }
+                PQVERIFY_OPCODE => {
+                    let algo_id = self.pop()?.to::<u8>();
+                    let offset = u256_to_usize(self.pop()?)?;
+                    let len = u256_to_usize(self.pop()?)?;
+                    let memory_gas = self.memory.resize_for_access(offset, len)?;
+                    gas.charge(memory_gas)?;
+                    let input = self.memory.load(offset, len)?.to_vec();
+                    let precompile = match algo_id {
+                        0x01 => Some(ML_DSA_65_VERIFY),
+                        0x02 => Some(SLH_DSA_SHA2_256F_VERIFY),
+                        _ => None,
+                    };
+                    let valid = if let Some(address) = precompile {
+                        let output = BasicPqPrecompiles
+                            .execute(address, &input, gas.remaining())
+                            .map_err(|err| InterpreterError::Precompile(err.to_string()))?
+                            .ok_or_else(|| {
+                                InterpreterError::Precompile("missing PQVERIFY precompile".into())
+                            })?;
+                        gas.charge(output.gas_used)?;
+                        output.output.first().copied().unwrap_or_default()
+                    } else {
+                        0
+                    };
+                    self.push(U256::from(valid))?;
+                }
+                PQHASH_OPCODE => {
+                    let dest = u256_to_usize(self.pop()?)?;
+                    let offset = u256_to_usize(self.pop()?)?;
+                    let len = u256_to_usize(self.pop()?)?;
+                    let memory_gas = self.memory.resize_for_access(offset, len)?;
+                    gas.charge(memory_gas)?;
+                    let input = self.memory.load(offset, len)?.to_vec();
+                    let output = BasicPqPrecompiles
+                        .execute(BLAKE3_256, &input, gas.remaining())
+                        .map_err(|err| InterpreterError::Precompile(err.to_string()))?
+                        .ok_or_else(|| {
+                            InterpreterError::Precompile("missing PQHASH precompile".into())
+                        })?;
+                    gas.charge(output.gas_used)?;
+                    let memory_gas = self.memory.store(dest, &output.output)?;
+                    gas.charge(memory_gas)?;
+                }
+                PQADDR_OPCODE => {
+                    let dest = u256_to_usize(self.pop()?)?;
+                    let offset = u256_to_usize(self.pop()?)?;
+                    let len = u256_to_usize(self.pop()?)?;
+                    let memory_gas = self.memory.resize_for_access(offset, len)?;
+                    gas.charge(memory_gas)?;
+                    let input = self.memory.load(offset, len)?.to_vec();
+                    let output = BasicPqPrecompiles
+                        .execute(PQADDRESS_DERIVE, &input, gas.remaining())
+                        .map_err(|err| InterpreterError::Precompile(err.to_string()))?
+                        .ok_or_else(|| {
+                            InterpreterError::Precompile("missing PQADDR precompile".into())
+                        })?;
+                    gas.charge(output.gas_used)?;
+                    let memory_gas = self.memory.store(dest, &output.output)?;
+                    gas.charge(memory_gas)?;
+                }
                 0xf2 => return Err(InterpreterError::RemovedOpcode("CALLCODE")),
                 0xf3 => {
                     let offset = u256_to_usize(self.pop()?)?;
@@ -515,6 +582,8 @@ impl PqvmDatabase for EmptyDb {
 mod tests {
     use super::*;
     use alloy_primitives::Bytes;
+    use pqcrypto_dilithium::dilithium3;
+    use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
 
     fn env() -> Env {
         Env {
@@ -694,6 +763,97 @@ mod tests {
 
         assert_eq!(result.status, ExecutionStatus::Revert);
         assert_eq!(result.output.as_ref(), &[0xee]);
+    }
+
+    #[test]
+    fn pqhash_opcode_writes_blake3_256_to_memory() {
+        let mut db = EmptyDb;
+        let mut interpreter = Interpreter::default();
+        interpreter.memory.store(0, b"abc").unwrap();
+        interpreter
+            .execute(
+                &mut db,
+                &env(),
+                &tx(&[
+                    0x60,
+                    0x03, // len
+                    0x60,
+                    0x00, // offset
+                    0x60,
+                    0x20, // destination
+                    PQHASH_OPCODE,
+                    0x00,
+                ]),
+            )
+            .unwrap();
+
+        assert_eq!(
+            &interpreter.memory.as_slice()[32..64],
+            blake3::hash(b"abc").as_bytes()
+        );
+    }
+
+    #[test]
+    fn pqaddr_opcode_writes_derived_address_to_memory() {
+        let mut db = EmptyDb;
+        let mut interpreter = Interpreter::default();
+        let mut input = vec![0x01];
+        input.extend_from_slice(b"public-key");
+        interpreter.memory.store(0, &input).unwrap();
+        interpreter
+            .execute(
+                &mut db,
+                &env(),
+                &tx(&[
+                    0x60,
+                    input.len() as u8, // len
+                    0x60,
+                    0x00, // offset
+                    0x60,
+                    0x40, // destination
+                    PQADDR_OPCODE,
+                    0x00,
+                ]),
+            )
+            .unwrap();
+
+        assert_eq!(
+            &interpreter.memory.as_slice()[64..96],
+            PQAddress::derive(0x01, b"public-key").as_bytes()
+        );
+    }
+
+    #[test]
+    fn pqverify_opcode_pushes_one_for_valid_ml_dsa_signature() {
+        let mut db = EmptyDb;
+        let mut interpreter = Interpreter::default();
+        let (pk, sk) = dilithium3::keypair();
+        let message = b"pqverify opcode";
+        let sig = dilithium3::detached_sign(message, &sk);
+        let mut input = Vec::new();
+        input.extend_from_slice(pk.as_bytes());
+        input.extend_from_slice(sig.as_bytes());
+        input.extend_from_slice(message);
+        interpreter.memory.store(0, &input).unwrap();
+        interpreter
+            .execute(
+                &mut db,
+                &env(),
+                &tx(&[
+                    0x61,
+                    ((input.len() >> 8) & 0xff) as u8,
+                    (input.len() & 0xff) as u8, // len
+                    0x60,
+                    0x00, // offset
+                    0x60,
+                    0x01, // algo id
+                    PQVERIFY_OPCODE,
+                    0x00,
+                ]),
+            )
+            .unwrap();
+
+        assert_eq!(interpreter.pop().unwrap(), U256::from(1));
     }
 
     #[test]

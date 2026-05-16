@@ -1198,6 +1198,9 @@ name = "pqvm-interpreter"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "blake3",
+ "pqcrypto-dilithium",
+ "pqcrypto-traits",
  "pqvm-gas",
  "pqvm-precompiles",
  "pqvm-primitives",
