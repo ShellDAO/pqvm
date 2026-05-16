@@ -21,10 +21,12 @@ blake3 = "1"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+pqcrypto-dilithium = "0.5"
+pqcrypto-sphincsplus = "0.7"
+pqcrypto-traits = "0.3"
 
 pqvm-primitives = { path = "crates/pqvm-primitives" }
 pqvm-gas = { path = "crates/pqvm-gas" }
 pqvm-state = { path = "crates/pqvm-state" }
 pqvm-precompiles = { path = "crates/pqvm-precompiles" }
 pqvm-interpreter = { path = "crates/pqvm-interpreter" }
-

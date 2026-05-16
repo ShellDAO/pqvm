@@ -101,12 +101,12 @@ fn gas_constants_match_pqvm_1() {
 }
 
 #[test]
-fn initial_precompile_set_exposes_only_implemented_precompiles() {
+fn precompile_set_exposes_pqvm_1_precompiles() {
     let precompiles = BasicPqPrecompiles;
 
-    assert!(!precompiles.contains(ML_DSA_65_VERIFY));
-    assert!(!precompiles.contains(SLH_DSA_SHA2_256F_VERIFY));
-    assert!(!precompiles.contains(ML_DSA_65_BATCH_VERIFY));
+    assert!(precompiles.contains(ML_DSA_65_VERIFY));
+    assert!(precompiles.contains(SLH_DSA_SHA2_256F_VERIFY));
+    assert!(precompiles.contains(ML_DSA_65_BATCH_VERIFY));
     assert!(precompiles.contains(BLAKE3_256));
     assert!(precompiles.contains(BLAKE3_512));
     assert!(precompiles.contains(PQADDRESS_DERIVE));
