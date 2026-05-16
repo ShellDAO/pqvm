@@ -1,0 +1,13 @@
+# PQVM-1 transaction signing-payload golden vectors.
+
+vector_0_chain_id=1
+vector_0_nonce=7
+vector_0_max_fee=1000000000
+vector_0_gas_limit=67000
+vector_0_to=0xede2fcd1b5890ee15de92497aee44f14a252609891e6ad05e40b12a8c78c962b
+vector_0_value=42
+vector_0_data_ascii=hello
+vector_0_sig_type=1
+vector_0_public_key_ascii=public-key
+vector_0_signature_ascii=signature
+vector_0_signing_payload=0x1ac69e9f7625403299a7ffe253dd9e6e21e1a70962302ba516e90d10e6ffe9cd

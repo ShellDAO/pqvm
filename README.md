@@ -31,3 +31,24 @@ interpreter facade. Full opcode execution and Shell-Chain integration are next.
 
 - [`docs/PQVM-1.md`](docs/PQVM-1.md) is the current executable specification
   draft.
+
+## Development checks
+
+Run the workspace checks before submitting changes:
+
+```bash
+cargo fmt --check
+cargo clippy --workspace -- -D warnings
+cargo test --workspace
+```
+
+## Conformance fixtures
+
+The first PQVM-1 golden vectors live under `tests/fixtures/` and are exercised
+by the facade crate integration tests:
+
+- `pqaddress_vectors.txt`: PQAddress derivation and precompile address vectors.
+- `pqtx_vectors.txt`: PQTx signing-payload vector.
+
+These fixtures are intentionally small and stable; expand them whenever a
+specification rule becomes executable.
