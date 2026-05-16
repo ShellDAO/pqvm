@@ -4,10 +4,13 @@ use pqvm::precompiles::{
     BasicPqPrecompiles, PrecompileSet, BLAKE3_256, BLAKE3_512, ML_DSA_65_BATCH_VERIFY,
     ML_DSA_65_VERIFY, PQADDRESS_DERIVE, SLH_DSA_SHA2_256F_VERIFY,
 };
-use pqvm::{AlgoId, Env, Interpreter, InterpreterError, PQAddress, PQTx, PqvmDatabase};
+use pqvm::{
+    AlgoId, Env, FrameContext, Interpreter, InterpreterError, PQAddress, PQTx, PqvmDatabase,
+};
 
 const PQADDRESS_VECTORS: &str = include_str!("../../../tests/fixtures/pqaddress_vectors.txt");
 const PQTX_VECTORS: &str = include_str!("../../../tests/fixtures/pqtx_vectors.txt");
+const OPCODE_VECTORS: &str = include_str!("../../../tests/fixtures/opcode_vectors.json");
 
 #[test]
 fn pqaddress_derivation_matches_golden_vectors() {
@@ -196,5 +199,73 @@ impl PqvmDatabase for EmptyDb {
     }
     fn state_commit(&mut self, _: usize) -> Result<(), Self::Error> {
         Ok(())
+    }
+}
+
+/// Run opcode conformance vectors from `tests/fixtures/opcode_vectors.json`.
+///
+/// Each vector provides hex bytecode, optional hex calldata, and the expected
+/// stack top (as a 0x-prefixed U256). Vectors with `_note` fields are still
+/// executed — the note documents any known EmptyDb limitations.
+#[test]
+fn opcode_vectors_match_golden_values() {
+    let parsed: serde_json::Value =
+        serde_json::from_str(OPCODE_VECTORS).expect("opcode_vectors.json is valid JSON");
+    let vectors = parsed["vectors"].as_array().expect("vectors is array");
+
+    let env = Env {
+        chain_id: 1,
+        block_number: 0,
+        coinbase: PQAddress::zero(),
+        gas_limit: gas::BLOCK_GAS_LIMIT,
+        timestamp: 0,
+    };
+
+    for vec in vectors {
+        let id = vec["id"].as_str().unwrap_or("?");
+        let bytecode_hex = vec["bytecode"].as_str().unwrap_or("").replace(' ', "");
+        let calldata_hex = vec["calldata"].as_str().unwrap_or("").replace(' ', "");
+        let expected_hex = vec["expected_stack_top"]
+            .as_str()
+            .unwrap_or("0x0")
+            .trim_start_matches("0x");
+
+        let code = hex::decode(&bytecode_hex)
+            .unwrap_or_else(|e| panic!("vector {id}: bad bytecode hex: {e}"));
+        let calldata_bytes = if calldata_hex.is_empty() {
+            Bytes::new()
+        } else {
+            Bytes::from(
+                hex::decode(&calldata_hex)
+                    .unwrap_or_else(|e| panic!("vector {id}: bad calldata hex: {e}")),
+            )
+        };
+        let expected = U256::from_be_slice(
+            &hex::decode(format!("{:0>64}", expected_hex))
+                .unwrap_or_else(|e| panic!("vector {id}: bad expected hex: {e}")),
+        );
+
+        let ctx = FrameContext {
+            code,
+            calldata: calldata_bytes,
+            caller: PQAddress::zero(),
+            address: PQAddress::zero(),
+            value: U256::ZERO,
+            origin: PQAddress::zero(),
+            is_static: false,
+            depth: 0,
+            gas_limit: gas::BLOCK_GAS_LIMIT,
+        };
+
+        let mut db = EmptyDb;
+        let mut interp = Interpreter::default();
+        interp
+            .execute_frame(&mut db, &env, &ctx)
+            .unwrap_or_else(|e| panic!("vector {id}: execution error: {e:?}"));
+
+        let top = interp
+            .pop()
+            .unwrap_or_else(|e| panic!("vector {id}: stack empty after execution: {e:?}"));
+        assert_eq!(top, expected, "vector {id} stack top mismatch");
     }
 }

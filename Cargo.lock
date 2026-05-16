@@ -1188,6 +1188,7 @@ dependencies = [
  "pqvm-precompiles",
  "pqvm-primitives",
  "pqvm-state",
+ "serde_json",
  "thiserror",
 ]
 

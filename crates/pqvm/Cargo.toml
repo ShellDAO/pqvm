@@ -19,3 +19,4 @@ thiserror.workspace = true
 hex.workspace = true
 pqcrypto-dilithium.workspace = true
 pqcrypto-traits.workspace = true
+serde_json.workspace = true

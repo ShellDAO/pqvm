@@ -1,6 +1,6 @@
 //! PQVM interpreter scaffold.
 
-use alloy_primitives::{keccak256, Bytes, B256, U256};
+use alloy_primitives::{keccak256, Bytes, B256, I256, U256};
 use pqvm_gas::{
     GAS_BALANCE, GAS_BASEFEE, GAS_BLOCKHASH, GAS_CALL_BASE, GAS_CALL_NEW_ACCOUNT, GAS_CALL_STIPEND,
     GAS_CALL_VALUE, GAS_CHAINID, GAS_COPY_PER_WORD, GAS_CREATE2_EXTRA_PER_WORD, GAS_CREATE_BASE,
@@ -421,16 +421,16 @@ impl Interpreter {
                     if a.is_zero() {
                         return U256::ZERO;
                     }
-                    let (a_i, b_i) = (i256(a), i256(b));
-                    i256_to_u256(b_i.wrapping_div(a_i))
+                    let (a_i, b_i) = (I256::from_raw(a), I256::from_raw(b));
+                    b_i.wrapping_div(a_i).into_raw()
                 })?,
                 0x06 => self.binary_op(|a, b| if a.is_zero() { U256::ZERO } else { b % a })?,
                 0x07 => self.binary_op(|a, b| {
                     if a.is_zero() {
                         return U256::ZERO;
                     }
-                    let (a_i, b_i) = (i256(a), i256(b));
-                    i256_to_u256(b_i.wrapping_rem(a_i))
+                    let (a_i, b_i) = (I256::from_raw(a), I256::from_raw(b));
+                    b_i.wrapping_rem(a_i).into_raw()
                 })?,
                 0x08 => {
                     let a = self.pop()?;
@@ -456,8 +456,8 @@ impl Interpreter {
                 // ── Comparison ────────────────────────────────────────────
                 0x10 => self.binary_op(|a, b| U256::from(b < a))?,
                 0x11 => self.binary_op(|a, b| U256::from(b > a))?,
-                0x12 => self.binary_op(|a, b| U256::from(i256(b) < i256(a)))?,
-                0x13 => self.binary_op(|a, b| U256::from(i256(b) > i256(a)))?,
+                0x12 => self.binary_op(|a, b| U256::from(I256::from_raw(b) < I256::from_raw(a)))?,
+                0x13 => self.binary_op(|a, b| U256::from(I256::from_raw(b) > I256::from_raw(a)))?,
                 0x14 => self.binary_op(|a, b| U256::from(a == b))?,
                 0x15 => {
                     let value = self.pop()?;
@@ -1303,9 +1303,10 @@ fn shift_right(shift: U256, value: U256) -> U256 {
     }
 }
 
-/// Arithmetic shift right.
+/// Arithmetic shift right — uses I256 for correct two's-complement semantics.
 fn sar(shift: U256, value: U256) -> U256 {
     if shift >= U256::from(256) {
+        // All bits become the sign bit.
         if value.bit(255) {
             U256::MAX
         } else {
@@ -1313,15 +1314,7 @@ fn sar(shift: U256, value: U256) -> U256 {
         }
     } else {
         let shift = shift.to::<usize>();
-        let sign_bit = value.bit(255);
-        let shifted = value >> shift;
-        if sign_bit {
-            // Fill upper bits with 1s.
-            let mask = U256::MAX.wrapping_shl(256 - shift);
-            shifted | mask
-        } else {
-            shifted
-        }
+        I256::from_raw(value).asr(shift).into_raw()
     }
 }
 
@@ -1330,30 +1323,6 @@ fn u256_to_usize(value: U256) -> Result<usize, InterpreterError> {
         return Err(InterpreterError::MemoryOverflow);
     }
     Ok(value.to::<usize>())
-}
-
-/// Interpret a U256 as a two's-complement i256.
-fn i256(v: U256) -> i128 {
-    // Use lower 128 bits with sign extension for approximate signed arithmetic.
-    // Full 256-bit signed arithmetic would require a dedicated type; for
-    // PQVM-1 this approximation is sufficient for the div/mod/lt/gt opcodes.
-    let lo = v.to::<i128>();
-    if v.bit(255) {
-        // negative: sign-extend
-        lo | (i128::MIN)
-    } else {
-        lo & i128::MAX
-    }
-}
-
-fn i256_to_u256(v: i128) -> U256 {
-    if v < 0 {
-        // sign-extend to 256 bits
-        let bits = v as u128;
-        U256::from(bits) | (U256::MAX << 128)
-    } else {
-        U256::from(v as u128)
-    }
 }
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
@@ -1987,5 +1956,71 @@ mod tests {
         assert_eq!(opcode_info(0xf1).unwrap().name, "CALL");
         assert_eq!(opcode_info(0xff).unwrap().name, "SELFDESTRUCT");
         assert!(opcode_info(0xfe).is_none());
+    }
+
+    /// Tests for SDIV/SMOD/SLT/SGT/SAR using full 256-bit I256.
+    /// Validates that large signed values (>128 bit) work correctly.
+    #[test]
+    fn signed_arithmetic_uses_full_i256() {
+        let mut db = EmptyDb;
+        let env = env();
+
+        // SDIV: (-1) / 2 = 0 (truncated toward zero)
+        // binary_op pops `a` first (top/divisor), `b` second (dividend).
+        // So push dividend first then divisor on top.
+        let neg1 = U256::MAX; // two's-complement -1
+        let mut code = vec![0x7fu8]; // PUSH32 neg1 (dividend, will be `b`)
+        code.extend_from_slice(&neg1.to_be_bytes::<32>());
+        code.push(0x60); // PUSH1 2 (divisor, will be `a` = top of stack)
+        code.push(0x02);
+        code.push(0x05); // SDIV  → result = b/a = (-1)/2 = 0
+        code.push(0x00); // STOP
+        let ctx = FrameContext {
+            code: code.clone(),
+            calldata: Bytes::new(),
+            caller: PQAddress::zero(),
+            address: PQAddress::zero(),
+            value: U256::ZERO,
+            origin: PQAddress::zero(),
+            is_static: false,
+            depth: 0,
+            gas_limit: 1_000_000,
+        };
+        let mut interp = Interpreter::default();
+        interp.execute_frame(&mut db, &env, &ctx).unwrap();
+        // -1 / 2 = 0 (truncated toward zero in EVM signed div)
+        assert_eq!(interp.pop().unwrap(), U256::ZERO);
+
+        // SLT: large negative < large positive → 1
+        // Push I256::MIN (most negative) and I256::MAX (most positive), then SLT
+        let i256_min: U256 = U256::from(1u8) << 255; // bit255 set, rest zero = I256::MIN
+        let i256_max: U256 = (U256::from(1u8) << 255) - U256::from(1u8); // 0x7fff...fff = I256::MAX
+                                                                         // SLT pushes `b` first (dividend/second), `a` on top (first popped).
+                                                                         // Result: b < a. We want i256_min < i256_max → push i256_min first, then i256_max on top.
+        let mut code2 = vec![0x7fu8]; // PUSH32 i256_min (will be `b`)
+        code2.extend_from_slice(&i256_min.to_be_bytes::<32>());
+        code2.push(0x7f); // PUSH32 i256_max (will be `a` = top)
+        code2.extend_from_slice(&i256_max.to_be_bytes::<32>());
+        code2.push(0x12); // SLT: b < a → i256_min < i256_max → true
+        code2.push(0x00);
+        let ctx2 = FrameContext {
+            code: code2,
+            ..ctx.clone()
+        };
+        let mut interp2 = Interpreter::default();
+        interp2.execute_frame(&mut db, &env, &ctx2).unwrap();
+        assert_eq!(interp2.pop().unwrap(), U256::from(1u8)); // -MIN < MAX → true
+
+        // SAR: arithmetic right-shift of -1 by 1 = -1 (fills with sign bit)
+        let mut code3 = vec![0x7fu8]; // PUSH32 -1
+        code3.extend_from_slice(&U256::MAX.to_be_bytes::<32>());
+        code3.push(0x60); // PUSH1 1
+        code3.push(0x01);
+        code3.push(0x1d); // SAR
+        code3.push(0x00);
+        let ctx3 = FrameContext { code: code3, ..ctx };
+        let mut interp3 = Interpreter::default();
+        interp3.execute_frame(&mut db, &env, &ctx3).unwrap();
+        assert_eq!(interp3.pop().unwrap(), U256::MAX); // SAR(-1, 1) = -1
     }
 }

@@ -1,0 +1,111 @@
+{
+  "_comment": "PQVM-1 opcode conformance vectors. bytecode is hex-encoded. In binary_op(|a,b|): a = first-popped (stack top, last-pushed), b = second-popped. expected_stack_top is the U256 at top of stack when STOP is hit.",
+  "vectors": [
+    {
+      "id": "sdiv_neg1_by_2",
+      "description": "SDIV(-1, 2)=0. Push -1 (b=dividend), push 2 (a=divisor=top). Result = b/a = 0.",
+      "bytecode": "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff60020500",
+      "calldata": "",
+      "expected_stack_top": "0x0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "id": "sdiv_min_by_neg1",
+      "description": "SDIV(I256::MIN, -1)=I256::MIN (EVM overflow). Push I256::MIN (b), push -1 (a=top).",
+      "bytecode": "7f80000000000000000000000000000000000000000000000000000000000000007fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0500",
+      "calldata": "",
+      "expected_stack_top": "0x8000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "id": "slt_min_lt_max",
+      "description": "SLT: I256::MIN < I256::MAX → 1. Push I256::MIN (b), push I256::MAX (a=top). b < a.",
+      "bytecode": "7f80000000000000000000000000000000000000000000000000000000000000007f7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff1200",
+      "calldata": "",
+      "expected_stack_top": "0x0000000000000000000000000000000000000000000000000000000000000001"
+    },
+    {
+      "id": "slt_max_lt_min",
+      "description": "SLT: I256::MAX < I256::MIN → 0. Push I256::MAX (b), push I256::MIN (a=top). b < a = false.",
+      "bytecode": "7f7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f80000000000000000000000000000000000000000000000000000000000000001200",
+      "calldata": "",
+      "expected_stack_top": "0x0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "id": "sgt_max_gt_min",
+      "description": "SGT: b > a where b=I256::MIN (second), a=I256::MAX (top). I256::MIN > I256::MAX = false → 0. Push I256::MIN (b), push I256::MAX (a).",
+      "bytecode": "7f80000000000000000000000000000000000000000000000000000000000000007f7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff1300",
+      "calldata": "",
+      "expected_stack_top": "0x0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "id": "sgt_pos_gt_neg",
+      "description": "SGT: 1 > -1 → 1. Push -1 (b), push 1 (a=top). b > a = false? No: b=-1, a=1, b>a = false → 0. Wait: SGT result = 1 if b > a. -1 > 1 = false → 0. But we want to test 1 > -1: push 1 (b), push -1 (a=top). b=1, a=-1. b > a → true → 1.",
+      "bytecode": "60017fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff1300",
+      "calldata": "",
+      "expected_stack_top": "0x0000000000000000000000000000000000000000000000000000000000000001"
+    },
+    {
+      "id": "sar_neg1_by_1",
+      "description": "SAR: -1 >> 1 = -1 (sign fills). Push -1 (b=value), push 1 (a=shift=top).",
+      "bytecode": "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff60011d00",
+      "calldata": "",
+      "expected_stack_top": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    },
+    {
+      "id": "sar_pos4_by_1",
+      "description": "SAR: 4 >> 1 = 2 (positive, no sign fill).",
+      "bytecode": "600460011d00",
+      "calldata": "",
+      "expected_stack_top": "0x0000000000000000000000000000000000000000000000000000000000000002"
+    },
+    {
+      "id": "sar_neg_shift_ge_256",
+      "description": "SAR: -1 >> 256 = -1 (shift>=256 fills all with sign bit 1).",
+      "bytecode": "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff6101001d00",
+      "calldata": "",
+      "expected_stack_top": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    },
+    {
+      "id": "sar_pos_shift_ge_256",
+      "description": "SAR: 1 >> 256 = 0 (positive, sign=0 fills).",
+      "bytecode": "60016101001d00",
+      "calldata": "",
+      "expected_stack_top": "0x0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "id": "keccak256_empty",
+      "description": "KECCAK256 of 0 bytes = 0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470.",
+      "bytecode": "600060002000",
+      "calldata": "",
+      "expected_stack_top": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+    },
+    {
+      "id": "sstore_sload_roundtrip",
+      "description": "SSTORE slot 0 value 42, SLOAD slot 0 → 42. Requires stateful EmptyDb (reads back 0 since EmptyDb discards writes).",
+      "bytecode": "602a60005560005400",
+      "calldata": "",
+      "expected_stack_top": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "_note": "EmptyDb discards SSTORE writes so SLOAD returns 0. Real state tests are in pqvm-interpreter unit tests."
+    },
+    {
+      "id": "calldataload_at_0",
+      "description": "CALLDATALOAD offset 0 returns first 32 bytes of calldata.",
+      "bytecode": "60003500",
+      "calldata": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+      "expected_stack_top": "0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+    },
+    {
+      "id": "mstore_mload_roundtrip",
+      "description": "MSTORE 0x42 at slot 0, MLOAD slot 0 → 0x42.",
+      "bytecode": "604260005260005100",
+      "calldata": "",
+      "expected_stack_top": "0x0000000000000000000000000000000000000000000000000000000000000042"
+    },
+    {
+      "id": "add_3_7",
+      "description": "ADD: 3 + 7 = 10. Push 3 (b), push 7 (a=top). b + a = 10.",
+      "bytecode": "600360070100",
+      "calldata": "",
+      "expected_stack_top": "0x000000000000000000000000000000000000000000000000000000000000000a"
+    }
+  ]
+}
