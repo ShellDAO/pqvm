@@ -13,14 +13,59 @@ pub struct AccountInfo {
 }
 
 /// Revm-inspired state boundary using PQ-native addresses.
+///
+/// Includes read, write, and checkpoint operations so the interpreter can
+/// implement SSTORE, CALL value transfers, CREATE, and sub-call rollback
+/// without knowing the concrete state type.
 pub trait PqvmDatabase {
     type Error: std::error::Error + Send + Sync + 'static;
+
+    // ── reads ──────────────────────────────────────────────────────────────
 
     fn account(&mut self, address: PQAddress) -> Result<Option<AccountInfo>, Self::Error>;
 
     fn storage(&mut self, address: PQAddress, index: U256) -> Result<U256, Self::Error>;
 
     fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error>;
+
+    // ── writes ─────────────────────────────────────────────────────────────
+
+    /// Upsert an account.
+    fn write_account(
+        &mut self,
+        address: PQAddress,
+        account: AccountInfo,
+    ) -> Result<(), Self::Error>;
+
+    /// Set a storage slot (zero value deletes the slot).
+    fn write_storage(
+        &mut self,
+        address: PQAddress,
+        index: U256,
+        value: U256,
+    ) -> Result<(), Self::Error>;
+
+    /// Delete an account and its storage.
+    fn erase_account(&mut self, address: PQAddress) -> Result<(), Self::Error>;
+
+    /// Transfer value between two accounts.  Creates the recipient if absent.
+    fn move_value(
+        &mut self,
+        from: PQAddress,
+        to: PQAddress,
+        value: U256,
+    ) -> Result<(), Self::Error>;
+
+    // ── checkpointing ──────────────────────────────────────────────────────
+
+    /// Snapshot the current state; returns an opaque checkpoint id.
+    fn state_checkpoint(&mut self) -> usize;
+
+    /// Roll back to a previously taken checkpoint.
+    fn state_revert(&mut self, checkpoint: usize) -> Result<(), Self::Error>;
+
+    /// Commit (discard) a checkpoint, making changes permanent.
+    fn state_commit(&mut self, checkpoint: usize) -> Result<(), Self::Error>;
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -189,13 +234,13 @@ impl PqvmState {
 }
 
 impl PqvmDatabase for PqvmState {
-    type Error = std::convert::Infallible;
+    type Error = StateError;
 
-    fn account(&mut self, address: PQAddress) -> Result<Option<AccountInfo>, Self::Error> {
+    fn account(&mut self, address: PQAddress) -> Result<Option<AccountInfo>, StateError> {
         Ok(self.accounts.get(&address).cloned())
     }
 
-    fn storage(&mut self, address: PQAddress, index: U256) -> Result<U256, Self::Error> {
+    fn storage(&mut self, address: PQAddress, index: U256) -> Result<U256, StateError> {
         Ok(self
             .storage
             .get(&(address, index))
@@ -203,8 +248,53 @@ impl PqvmDatabase for PqvmState {
             .unwrap_or_default())
     }
 
-    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+    fn block_hash(&mut self, number: u64) -> Result<B256, StateError> {
         Ok(self.block_hashes.get(&number).copied().unwrap_or_default())
+    }
+
+    fn write_account(
+        &mut self,
+        address: PQAddress,
+        account: AccountInfo,
+    ) -> Result<(), StateError> {
+        self.accounts.insert(address, account);
+        Ok(())
+    }
+
+    fn write_storage(
+        &mut self,
+        address: PQAddress,
+        index: U256,
+        value: U256,
+    ) -> Result<(), StateError> {
+        self.set_storage(address, index, value);
+        Ok(())
+    }
+
+    fn erase_account(&mut self, address: PQAddress) -> Result<(), StateError> {
+        self.remove_account(address);
+        Ok(())
+    }
+
+    fn move_value(
+        &mut self,
+        from: PQAddress,
+        to: PQAddress,
+        value: U256,
+    ) -> Result<(), StateError> {
+        self.transfer(from, to, value)
+    }
+
+    fn state_checkpoint(&mut self) -> usize {
+        self.checkpoint()
+    }
+
+    fn state_revert(&mut self, checkpoint: usize) -> Result<(), StateError> {
+        self.revert_to_checkpoint(checkpoint)
+    }
+
+    fn state_commit(&mut self, checkpoint: usize) -> Result<(), StateError> {
+        self.discard_checkpoint(checkpoint)
     }
 }
 

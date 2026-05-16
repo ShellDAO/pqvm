@@ -175,4 +175,26 @@ impl PqvmDatabase for EmptyDb {
     fn block_hash(&mut self, _number: u64) -> Result<alloy_primitives::B256, Self::Error> {
         Ok(alloy_primitives::B256::ZERO)
     }
+
+    fn write_account(&mut self, _: PQAddress, _: pqvm::AccountInfo) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn write_storage(&mut self, _: PQAddress, _: U256, _: U256) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn erase_account(&mut self, _: PQAddress) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn move_value(&mut self, _: PQAddress, _: PQAddress, _: U256) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn state_checkpoint(&mut self) -> usize {
+        0
+    }
+    fn state_revert(&mut self, _: usize) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn state_commit(&mut self, _: usize) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }

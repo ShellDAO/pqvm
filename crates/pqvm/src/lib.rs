@@ -5,8 +5,8 @@ use precompiles::{PrecompileSet, ML_DSA_65_VERIFY, SLH_DSA_SHA2_256F_VERIFY};
 
 pub use pqvm_gas as gas;
 pub use pqvm_interpreter::{
-    opcode_info, Bytecode, Env, ExecutionResult, ExecutionStatus, GasMeter, Interpreter,
-    InterpreterError, Memory, OpcodeInfo,
+    opcode_info, Bytecode, Env, ExecutionResult, ExecutionStatus, FrameContext, GasMeter,
+    Interpreter, InterpreterError, LogEntry, Memory, OpcodeInfo,
 };
 pub use pqvm_precompiles as precompiles;
 pub use pqvm_primitives::{AlgoId, PQAddress, PQTx};
@@ -18,6 +18,7 @@ pub struct TxReceipt {
     pub status: ExecutionStatus,
     pub gas_used: u64,
     pub output: alloy_primitives::Bytes,
+    pub logs: Vec<LogEntry>,
     pub state_diff: StateDiff,
 }
 
@@ -178,8 +179,38 @@ pub fn execute_transaction(
     }
     state.increment_nonce(sender)?;
 
+    // Load the callee code from state; use tx.data as calldata.
+    // For contract creation (tx.to == None), tx.data is the initcode.
+    let (code, calldata) = if let Some(to) = tx.to {
+        let acct_code = state
+            .account_ref(to)
+            .map(|a| a.code.to_vec())
+            .unwrap_or_default();
+        (acct_code, tx.data.clone())
+    } else {
+        // CREATE: initcode = tx.data; calldata is empty
+        (tx.data.to_vec(), alloy_primitives::Bytes::new())
+    };
+
+    let sender_origin = sender;
+    let ctx = FrameContext {
+        code,
+        calldata,
+        caller: sender,
+        address: tx.to.unwrap_or_else(|| {
+            // Derive CREATE address from sender + nonce (nonce already incremented).
+            let nonce = state.account_ref(sender).map_or(1u64, |a| a.nonce);
+            create_address_from_nonce(sender, nonce.saturating_sub(1))
+        }),
+        value: tx.value,
+        origin: sender_origin,
+        is_static: false,
+        depth: 0,
+        gas_limit: tx.gas_limit.min(env.gas_limit),
+    };
+
     let mut interpreter = Interpreter::default();
-    let result = match interpreter.execute(state, env, tx) {
+    let result = match interpreter.execute_frame(state, env, &ctx) {
         Ok(result) => result,
         Err(err) => {
             state.revert_to_checkpoint(checkpoint)?;
@@ -195,6 +226,7 @@ pub fn execute_transaction(
         status: result.status,
         gas_used: result.gas_used,
         output: result.output,
+        logs: result.logs,
         state_diff,
     })
 }
@@ -266,6 +298,15 @@ fn reference_pqaccount_code_hash(sig_type: u8, public_key: &[u8]) -> alloy_primi
     alloy_primitives::B256::from_slice(hasher.finalize().as_bytes())
 }
 
+/// Derive a `CREATE` contract address: `BLAKE3(0x00 || sender || nonce_be8)[0:32]`.
+fn create_address_from_nonce(sender: PQAddress, nonce: u64) -> PQAddress {
+    let mut h = blake3::Hasher::new();
+    h.update(&[0x00]);
+    h.update(sender.as_bytes());
+    h.update(&nonce.to_be_bytes());
+    PQAddress(*h.finalize().as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,14 +324,14 @@ mod tests {
         }
     }
 
-    fn tx_with_keypair(value: u64, data: &[u8]) -> PQTx {
+    fn make_tx(value: u64, data: &[u8], to: Option<PQAddress>) -> PQTx {
         let (pk, sk) = dilithium3::keypair();
         let mut tx = PQTx {
             chain_id: 1,
             nonce: 0,
             max_fee: U256::ZERO,
             gas_limit: gas::BLOCK_GAS_LIMIT,
-            to: Some(PQAddress([0x22; 32])),
+            to,
             value: U256::from(value),
             data: Bytes::copy_from_slice(data),
             sig_type: AlgoId::MlDsa65 as u8,
@@ -300,6 +341,10 @@ mod tests {
         let signature = dilithium3::detached_sign(tx.signing_payload().as_slice(), &sk);
         tx.signature = Bytes::copy_from_slice(signature.as_bytes());
         tx
+    }
+
+    fn tx_with_keypair(value: u64, data: &[u8]) -> PQTx {
+        make_tx(value, data, Some(PQAddress([0x22; 32])))
     }
 
     #[test]
@@ -344,7 +389,17 @@ mod tests {
     #[test]
     fn execute_transaction_reverts_state_on_interpreter_error() {
         let mut state = PqvmState::default();
-        let tx = tx_with_keypair(0, &[0xf2]);
+        // Put CALLCODE (removed opcode) as the code of the target account.
+        let target = PQAddress([0x22; 32]);
+        state.insert_account(
+            target,
+            AccountInfo {
+                code: Bytes::from_static(&[0xf2]), // CALLCODE opcode
+                ..Default::default()
+            },
+        );
+        // tx sends empty calldata to the target (which has bad code).
+        let tx = tx_with_keypair(0, &[]);
         let sender = PQAddress::derive(tx.sig_type, tx.public_key.as_ref().unwrap());
         state.insert_account(
             sender,
@@ -402,8 +457,19 @@ mod tests {
     #[test]
     fn execute_block_reverts_all_transactions_on_failure() {
         let mut state = PqvmState::default();
-        let good = tx_with_keypair(0, &[0x00]);
-        let bad = tx_with_keypair(0, &[0xf2]);
+        // [0x22;32] is the target for good tx (empty account → STOP).
+        // [0x44;32] is the target for bad tx (CALLCODE code).
+        let bad_target = PQAddress([0x44; 32]);
+        state.insert_account(
+            bad_target,
+            AccountInfo {
+                code: Bytes::from_static(&[0xf2]), // CALLCODE opcode
+                ..Default::default()
+            },
+        );
+
+        let good = make_tx(0, &[], Some(PQAddress([0x22; 32])));
+        let bad = make_tx(0, &[], Some(bad_target));
         let good_sender = PQAddress::derive(good.sig_type, good.public_key.as_ref().unwrap());
 
         let err = execute_block(&mut state, &env(), &[good, bad]).unwrap_err();

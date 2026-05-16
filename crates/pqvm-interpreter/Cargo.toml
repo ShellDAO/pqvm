@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 alloy-primitives.workspace = true
+blake3.workspace = true
 pqvm-gas.workspace = true
 pqvm-precompiles.workspace = true
 pqvm-primitives.workspace = true
@@ -14,6 +15,6 @@ pqvm-state.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-blake3.workspace = true
 pqcrypto-dilithium.workspace = true
 pqcrypto-traits.workspace = true
+pqvm-state = { path = "../pqvm-state" }
