@@ -1,0 +1,15 @@
+[package]
+name = "pqvm-interpreter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+alloy-primitives.workspace = true
+pqvm-gas.workspace = true
+pqvm-precompiles.workspace = true
+pqvm-primitives.workspace = true
+pqvm-state.workspace = true
+thiserror.workspace = true
+

@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pqvm-primitives",
+    "crates/pqvm-gas",
+    "crates/pqvm-state",
+    "crates/pqvm-precompiles",
+    "crates/pqvm-interpreter",
+    "crates/pqvm",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ShellDAO/pqvm"
+
+[workspace.dependencies]
+alloy-primitives = { version = "1.5", features = ["serde", "rlp"] }
+blake3 = "1"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+pqvm-primitives = { path = "crates/pqvm-primitives" }
+pqvm-gas = { path = "crates/pqvm-gas" }
+pqvm-state = { path = "crates/pqvm-state" }
+pqvm-precompiles = { path = "crates/pqvm-precompiles" }
+pqvm-interpreter = { path = "crates/pqvm-interpreter" }
+
