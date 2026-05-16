@@ -7,7 +7,7 @@ repository.workspace = true
 
 [dependencies]
 alloy-primitives.workspace = true
+blake3.workspace = true
 pqvm-gas.workspace = true
 pqvm-primitives.workspace = true
 thiserror.workspace = true
-
