@@ -27,3 +27,7 @@ This repository is an implementation scaffold. It defines the crate topology,
 core PQ primitives, gas constants, state/precompile traits, and the initial
 interpreter facade. Full opcode execution and Shell-Chain integration are next.
 
+## Specification
+
+- [`docs/PQVM-1.md`](docs/PQVM-1.md) is the current executable specification
+  draft.
