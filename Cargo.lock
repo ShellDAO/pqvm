@@ -1111,12 +1111,14 @@ name = "pqvm"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "blake3",
  "hex",
  "pqvm-gas",
  "pqvm-interpreter",
  "pqvm-precompiles",
  "pqvm-primitives",
  "pqvm-state",
+ "thiserror",
 ]
 
 [[package]]
