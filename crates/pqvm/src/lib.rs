@@ -21,6 +21,12 @@ pub struct TxReceipt {
     pub state_diff: StateDiff,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockExecutionResult {
+    pub gas_used: u64,
+    pub receipts: Vec<TxReceipt>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TxExecutionError {
     #[error(
@@ -48,6 +54,74 @@ pub enum TxExecutionError {
     State(#[from] StateError),
     #[error(transparent)]
     Interpreter(#[from] InterpreterError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BlockExecutionError {
+    #[error("block has {count} transactions, above hard cap {max}")]
+    TooManyTransactions { count: usize, max: usize },
+    #[error("block gas limit exceeded: used {used}, next tx {next}, limit {limit}")]
+    BlockGasLimitExceeded { used: u64, next: u64, limit: u64 },
+    #[error("transaction {index} failed: {source}")]
+    Transaction {
+        index: usize,
+        #[source]
+        source: TxExecutionError,
+    },
+}
+
+pub fn execute_block(
+    state: &mut PqvmState,
+    env: &Env,
+    txs: &[PQTx],
+) -> Result<BlockExecutionResult, BlockExecutionError> {
+    if txs.len() > gas::MAX_TX_PER_BLOCK {
+        return Err(BlockExecutionError::TooManyTransactions {
+            count: txs.len(),
+            max: gas::MAX_TX_PER_BLOCK,
+        });
+    }
+
+    let checkpoint = state.checkpoint();
+    let mut receipts = Vec::with_capacity(txs.len());
+    let mut gas_used = 0u64;
+
+    for (index, tx) in txs.iter().enumerate() {
+        let receipt = match execute_transaction(state, env, tx) {
+            Ok(receipt) => receipt,
+            Err(source) => {
+                let _ = state.revert_to_checkpoint(checkpoint);
+                return Err(BlockExecutionError::Transaction { index, source });
+            }
+        };
+        let Some(next_gas_used) = gas_used.checked_add(receipt.gas_used) else {
+            let _ = state.revert_to_checkpoint(checkpoint);
+            return Err(BlockExecutionError::BlockGasLimitExceeded {
+                used: gas_used,
+                next: receipt.gas_used,
+                limit: env.gas_limit,
+            });
+        };
+        if next_gas_used > env.gas_limit {
+            let _ = state.revert_to_checkpoint(checkpoint);
+            return Err(BlockExecutionError::BlockGasLimitExceeded {
+                used: gas_used,
+                next: receipt.gas_used,
+                limit: env.gas_limit,
+            });
+        }
+        gas_used = next_gas_used;
+        receipts.push(receipt);
+    }
+
+    state
+        .discard_checkpoint(checkpoint)
+        .map_err(|source| BlockExecutionError::Transaction {
+            index: txs.len(),
+            source: TxExecutionError::State(source),
+        })?;
+
+    Ok(BlockExecutionResult { gas_used, receipts })
 }
 
 pub fn execute_transaction(
@@ -298,5 +372,49 @@ mod tests {
         let err = execute_transaction(&mut state, &env(), &tx).unwrap_err();
 
         assert!(matches!(err, TxExecutionError::InvalidSignature));
+    }
+
+    #[test]
+    fn execute_block_returns_receipts_and_cumulative_gas() {
+        let mut state = PqvmState::default();
+        let tx = tx_with_keypair(0, &[0x00]);
+
+        let result = execute_block(&mut state, &env(), &[tx]).unwrap();
+
+        assert_eq!(result.receipts.len(), 1);
+        assert_eq!(result.gas_used, result.receipts[0].gas_used);
+    }
+
+    #[test]
+    fn execute_block_enforces_transaction_hard_cap() {
+        let mut state = PqvmState::default();
+        let txs = vec![tx_with_keypair(0, &[0x00]); gas::MAX_TX_PER_BLOCK + 1];
+
+        let err = execute_block(&mut state, &env(), &txs).unwrap_err();
+
+        assert!(matches!(
+            err,
+            BlockExecutionError::TooManyTransactions { count, max }
+                if count == gas::MAX_TX_PER_BLOCK + 1 && max == gas::MAX_TX_PER_BLOCK
+        ));
+    }
+
+    #[test]
+    fn execute_block_reverts_all_transactions_on_failure() {
+        let mut state = PqvmState::default();
+        let good = tx_with_keypair(0, &[0x00]);
+        let bad = tx_with_keypair(0, &[0xf2]);
+        let good_sender = PQAddress::derive(good.sig_type, good.public_key.as_ref().unwrap());
+
+        let err = execute_block(&mut state, &env(), &[good, bad]).unwrap_err();
+
+        assert!(matches!(
+            err,
+            BlockExecutionError::Transaction {
+                index: 1,
+                source: TxExecutionError::Interpreter(InterpreterError::RemovedOpcode("CALLCODE"))
+            }
+        ));
+        assert!(state.account_ref(good_sender).is_none());
     }
 }
