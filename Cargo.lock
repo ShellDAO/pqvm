@@ -1138,6 +1138,7 @@ name = "pqvm-precompiles"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "blake3",
  "pqvm-gas",
  "pqvm-primitives",
  "thiserror",
