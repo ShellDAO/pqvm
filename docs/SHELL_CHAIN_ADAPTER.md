@@ -44,14 +44,14 @@ SDK support, and explorer support are complete.
 The adapter must avoid implicit truncation between current 20-byte addresses and
 PQVM 32-byte addresses. Any bridge type must be explicit:
 
-- current `shell_primitives::Address` is a current-network address,
+- legacy `shell_primitives::Address` bridges the current revm-backed network path,
 - `pqvm_primitives::PQAddress` is a PQVM-native address,
 - no `From` implementation should silently convert between them.
 
 ## Validation split
 
-Current Shell-Chain performs consensus-layer PQ signature validation before EVM
-execution. PQVM-1 keeps that split for block admission while also pricing
+Current Shell-Chain performs consensus-layer PQ signature validation before
+execution in the revm-backed path. PQVM-1 keeps that split for block admission while also pricing
 contract-visible `validateSignature()`, `PQVERIFY`, and PQ precompile execution
 inside PQVM gas.
 

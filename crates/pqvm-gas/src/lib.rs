@@ -15,7 +15,7 @@ pub const PQVERIFY_OPCODE: u8 = 0xB0;
 pub const PQHASH_OPCODE: u8 = 0xB1;
 pub const PQADDR_OPCODE: u8 = 0xB2;
 
-// ── EVM-compatible opcode gas ─────────────────────────────────────────────
+// ── Retained EVM-familiar opcode gas ──────────────────────────────────────
 
 pub const GAS_VERYLOW: u64 = 1;
 pub const GAS_LOW: u64 = 2;

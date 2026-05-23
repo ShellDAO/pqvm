@@ -3,10 +3,10 @@
 PQVM is the Post-Quantum Virtual Machine for Shell-Chain.
 
 The project is a clean Rust implementation modeled on revm's architecture
-without being a fork of revm. It keeps the parts of an EVM-style execution
-engine that are useful for developers--stack execution, 256-bit words, gas
-metering, database abstraction, and deterministic receipts--while replacing the
-classical cryptographic surface with Shell-Chain's PQ-native design.
+without being a fork of revm. It keeps EVM-familiar non-cryptographic semantics
+and tooling patterns--stack execution, 256-bit words, gas metering, database
+abstraction, and deterministic receipts--while replacing the classical
+cryptographic surface with Shell-Chain's PQ-native design.
 
 ## Design targets
 
