@@ -23,9 +23,13 @@ cryptographic surface with Shell-Chain's PQ-native design.
 
 ## Current status
 
-This repository is an implementation scaffold. It defines the crate topology,
-core PQ primitives, gas constants, state/precompile traits, and the initial
-interpreter facade. Full opcode execution and Shell-Chain integration are next.
+The core PQ execution layer is implemented: crate topology, PQ primitives, gas
+constants, state and precompile traits, the PQ precompile suite (ML-DSA-65
+verify / SLH-DSA verify / ML-DSA-65 batch / BLAKE3-256 / BLAKE3-512 / PQAddr
+derive), and the `execute_transaction_db` API. The PQVM-1 spec is locked.
+
+Native opcode interpreter dispatch for `PQVERIFY`, `PQHASH`, and `PQADDR` is
+being completed; that boundary is called out explicitly where relevant.
 
 ## Specification
 
