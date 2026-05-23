@@ -121,6 +121,8 @@ pub enum InterpreterError {
     CreateCollision(PQAddress),
     #[error("call or create inside a static context")]
     StaticViolation,
+    #[error("unknown PQ algorithm id: 0x{0:02x}")]
+    InvalidPqAlgo(u8),
 }
 
 // ── GasMeter ──────────────────────────────────────────────────────────────────
@@ -611,7 +613,10 @@ impl Interpreter {
 
                 // ── Block information ─────────────────────────────────────
                 0x40 => {
-                    let n = self.pop()?.to::<u64>();
+                    // saturating_to: a U256 > u64::MAX saturates to u64::MAX which
+                    // exceeds any plausible block number; the DB returns B256::ZERO
+                    // for unknown heights, matching EVM BLOCKHASH semantics.
+                    let n = self.pop()?.saturating_to::<u64>();
                     let h = db_err!(db.block_hash(n))?;
                     self.push(U256::from_be_bytes(h.0))?;
                 }
@@ -768,7 +773,9 @@ impl Interpreter {
 
                 // ── PQ native opcodes ─────────────────────────────────────
                 PQVERIFY_OPCODE => {
-                    let algo_id = self.pop()?.to::<u8>();
+                    // saturating_to avoids panic on U256 values > u8::MAX;
+                    // unknown algo_ids are then rejected with an explicit error.
+                    let algo_id = self.pop()?.saturating_to::<u8>();
                     let offset = u256_to_usize(self.pop()?)?;
                     let len = u256_to_usize(self.pop()?)?;
                     let mem_gas = self.memory.resize_for_access(offset, len)?;
@@ -777,7 +784,7 @@ impl Interpreter {
                     let precompile = match algo_id {
                         0x01 => Some(ML_DSA_65_VERIFY),
                         0x02 => Some(SLH_DSA_SHA2_256F_VERIFY),
-                        _ => None,
+                        other => return Err(InterpreterError::InvalidPqAlgo(other)),
                     };
                     let valid = if let Some(address) = precompile {
                         let output = BasicPqPrecompiles
@@ -2097,5 +2104,71 @@ mod tests {
         let mut interp3 = Interpreter::default();
         interp3.execute_frame(&mut db, &env, &ctx3).unwrap();
         assert_eq!(interp3.pop().unwrap(), U256::MAX); // SAR(-1, 1) = -1
+    }
+
+    /// H-2 regression: BLOCKHASH with stack-top > u64::MAX must return B256::ZERO
+    /// without panicking (previously used .to::<u64>() which panics on overflow).
+    #[test]
+    fn blockhash_with_oversized_block_number_returns_zero() {
+        let mut db = EmptyDb;
+        let mut interpreter = Interpreter::default();
+        // Push U256::MAX as the block number — far beyond any real chain height.
+        let mut code = vec![0x7fu8]; // PUSH32
+        code.extend_from_slice(&U256::MAX.to_be_bytes::<32>());
+        code.push(0x40); // BLOCKHASH
+        code.push(0x00); // STOP
+
+        let ctx = FrameContext {
+            code,
+            calldata: Bytes::new(),
+            caller: PQAddress::zero(),
+            address: PQAddress::zero(),
+            value: U256::ZERO,
+            origin: PQAddress::zero(),
+            is_static: false,
+            depth: 0,
+            gas_limit: 1_000_000,
+        };
+        interpreter.execute_frame(&mut db, &env(), &ctx).unwrap();
+        // EmptyDb::block_hash always returns B256::ZERO; we just confirm no panic.
+        assert_eq!(interpreter.pop().unwrap(), U256::ZERO);
+    }
+
+    /// H-2 regression: PQVERIFY with algo_id 255 (unknown) must return
+    /// InvalidPqAlgo without panicking (previously .to::<u8>() would panic on
+    /// values > 255 and silently accepted unknown ids instead of erroring).
+    #[test]
+    fn pqverify_with_unknown_algo_returns_invalid_pq_algo() {
+        let mut db = EmptyDb;
+        let mut interpreter = Interpreter::default();
+        // algo_id = 255, len = 0, offset = 0.
+        let code = vec![
+            0x60,
+            0x00, // len = 0
+            0x60,
+            0x00, // offset = 0
+            0x60,
+            0xff, // algo_id = 255
+            PQVERIFY_OPCODE,
+            0x00,
+        ];
+        let ctx = FrameContext {
+            code,
+            calldata: Bytes::new(),
+            caller: PQAddress::zero(),
+            address: PQAddress::zero(),
+            value: U256::ZERO,
+            origin: PQAddress::zero(),
+            is_static: false,
+            depth: 0,
+            gas_limit: 1_000_000,
+        };
+        let err = interpreter
+            .execute_frame(&mut db, &env(), &ctx)
+            .unwrap_err();
+        assert!(
+            matches!(err, InterpreterError::InvalidPqAlgo(0xff)),
+            "expected InvalidPqAlgo(0xff), got {err:?}"
+        );
     }
 }
