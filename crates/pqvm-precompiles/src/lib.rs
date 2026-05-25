@@ -13,6 +13,7 @@ use pqvm_primitives::PQAddress;
 pub const ML_DSA_65_VERIFY: PQAddress = numbered_precompile(1);
 pub const SLH_DSA_SHA2_256F_VERIFY: PQAddress = numbered_precompile(2);
 pub const ML_DSA_65_BATCH_VERIFY: PQAddress = numbered_precompile(3);
+pub const MAX_BATCH_SIGNATURES: usize = 256;
 pub const BLAKE3_256: PQAddress = numbered_precompile(4);
 pub const BLAKE3_512: PQAddress = numbered_precompile(5);
 pub const PQADDRESS_DERIVE: PQAddress = numbered_precompile(6);
@@ -57,6 +58,8 @@ pub enum PrecompileError {
     MissingAlgoId,
     #[error("batch input has trailing bytes")]
     BatchTrailingBytes,
+    #[error("batch input count {count} exceeds max {max}")]
+    BatchTooLarge { count: usize, max: usize },
 }
 
 impl PrecompileSet for BasicPqPrecompiles {
@@ -96,9 +99,16 @@ impl PrecompileSet for BasicPqPrecompiles {
                 }))
             }
             ML_DSA_65_BATCH_VERIFY => {
-                let (count, valid) = verify_ml_dsa_65_batch(input)?;
+                let count = parse_ml_dsa_65_batch_count(input);
+                if count > MAX_BATCH_SIGNATURES {
+                    return Err(PrecompileError::BatchTooLarge {
+                        count,
+                        max: MAX_BATCH_SIGNATURES,
+                    });
+                }
                 let gas_used = ML_DSA_65_BATCH_VERIFY_GAS_PER_SIG.saturating_mul(count as u64);
                 charge(gas_used, gas_limit)?;
+                let valid = verify_ml_dsa_65_batch(input, count)?;
                 Ok(Some(PrecompileOutput {
                     gas_used,
                     output: bool_output(valid),
@@ -193,17 +203,26 @@ fn verify_slh_dsa_sha2_256f(input: &[u8]) -> bool {
     sphincssha2256fsimple::verify_detached_signature(&sig, message, &pk).is_ok()
 }
 
-fn verify_ml_dsa_65_batch(input: &[u8]) -> Result<(usize, bool), PrecompileError> {
-    let Some(count_bytes) = input.get(..4) else {
-        return Ok((0, false));
-    };
-    let count = u32::from_be_bytes(count_bytes.try_into().expect("slice length checked")) as usize;
+fn parse_ml_dsa_65_batch_count(input: &[u8]) -> usize {
+    input
+        .get(..4)
+        .map(|count_bytes| {
+            u32::from_be_bytes(count_bytes.try_into().expect("slice length checked")) as usize
+        })
+        .unwrap_or(0)
+}
+
+fn verify_ml_dsa_65_batch(input: &[u8], count: usize) -> Result<bool, PrecompileError> {
+    if input.len() < 4 {
+        return Ok(false);
+    }
+
     let mut cursor = 4usize;
     let mut valid = true;
 
     for _ in 0..count {
         let Some(len_bytes) = input.get(cursor..cursor + 4) else {
-            return Ok((count, false));
+            return Ok(false);
         };
         cursor += 4;
         let msg_len =
@@ -215,10 +234,10 @@ fn verify_ml_dsa_65_batch(input: &[u8]) -> Result<(usize, bool), PrecompileError
             .and_then(|value| value.checked_add(sig_len))
             .and_then(|value| value.checked_add(msg_len))
         else {
-            return Ok((count, false));
+            return Ok(false);
         };
         let Some(item) = input.get(cursor..end) else {
-            return Ok((count, false));
+            return Ok(false);
         };
         valid &= verify_ml_dsa_65(item);
         cursor = end;
@@ -228,7 +247,7 @@ fn verify_ml_dsa_65_batch(input: &[u8]) -> Result<(usize, bool), PrecompileError
         return Err(PrecompileError::BatchTrailingBytes);
     }
 
-    Ok((count, valid))
+    Ok(valid)
 }
 
 fn bool_output(valid: bool) -> Bytes {
@@ -333,6 +352,25 @@ mod tests {
 
         assert_eq!(output.gas_used, ML_DSA_65_BATCH_VERIFY_GAS_PER_SIG);
         assert_eq!(output.output.as_ref(), &[1]);
+    }
+
+    #[test]
+    fn ml_dsa_batch_verify_rejects_oversized_batch() {
+        let err = BasicPqPrecompiles
+            .execute(
+                ML_DSA_65_BATCH_VERIFY,
+                &(MAX_BATCH_SIGNATURES as u32 + 1).to_be_bytes(),
+                u64::MAX,
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            PrecompileError::BatchTooLarge {
+                count: MAX_BATCH_SIGNATURES + 1,
+                max: MAX_BATCH_SIGNATURES,
+            }
+        );
     }
 
     #[test]

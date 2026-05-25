@@ -4,6 +4,8 @@ pub const BLOCK_GAS_LIMIT: u64 = 50_000_000;
 pub const MAX_TX_PER_BLOCK: usize = 500;
 
 pub const INTRINSIC_GAS_TX: u64 = 21_000;
+pub const TX_DATA_ZERO_GAS: u64 = 4;
+pub const TX_DATA_NON_ZERO_GAS: u64 = 16;
 pub const ML_DSA_65_VERIFY_GAS: u64 = 46_000;
 pub const SLH_DSA_SHA2_256F_VERIFY_GAS: u64 = 2_300_000;
 pub const ML_DSA_65_BATCH_VERIFY_GAS_PER_SIG: u64 = 12_000;

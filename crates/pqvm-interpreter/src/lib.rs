@@ -117,6 +117,8 @@ pub enum InterpreterError {
     Precompile(String),
     #[error("state error: {0}")]
     Database(String),
+    #[error("create target already initialized: {0}")]
+    CreateCollision(PQAddress),
     #[error("call or create inside a static context")]
     StaticViolation,
 }
@@ -967,6 +969,9 @@ impl Interpreter {
                     // Derive new contract address: BLAKE3(0x00 || sender || nonce).
                     let nonce = db_err!(db.account(ctx.address))?.map_or(0u64, |a| a.nonce);
                     let new_addr = create_address(ctx.address, nonce);
+                    if account_has_code_or_storage(db, new_addr)? {
+                        return Err(InterpreterError::CreateCollision(new_addr));
+                    }
 
                     let checkpoint = db.state_checkpoint();
                     if !value.is_zero() {
@@ -1010,6 +1015,7 @@ impl Interpreter {
                                     ..acct
                                 },
                             ))?;
+                            increment_account_nonce(db, ctx.address)?;
                             db_err!(db.state_commit(checkpoint))?;
                             logs.extend(r.logs);
                             self.push(pqaddress_to_u256(new_addr))?;
@@ -1325,6 +1331,35 @@ fn u256_to_usize(value: U256) -> Result<usize, InterpreterError> {
     Ok(value.to::<usize>())
 }
 
+fn account_has_code_or_storage<DB: PqvmDatabase>(
+    db: &mut DB,
+    address: PQAddress,
+) -> Result<bool, InterpreterError> {
+    let has_code = db
+        .account(address)
+        .map_err(|err| InterpreterError::Database(err.to_string()))?
+        .is_some_and(|account| !account.code.is_empty());
+    if has_code {
+        return Ok(true);
+    }
+    db.has_storage(address)
+        .map_err(|err| InterpreterError::Database(err.to_string()))
+}
+
+fn increment_account_nonce<DB: PqvmDatabase>(
+    db: &mut DB,
+    address: PQAddress,
+) -> Result<(), InterpreterError> {
+    let mut account = db
+        .account(address)
+        .map_err(|err| InterpreterError::Database(err.to_string()))?
+        .unwrap_or_default();
+    account.nonce = account.nonce.saturating_add(1);
+    db.write_account(address, account)
+        .map_err(|err| InterpreterError::Database(err.to_string()))?;
+    Ok(())
+}
+
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default)]
@@ -1344,6 +1379,10 @@ impl PqvmDatabase for EmptyDb {
 
     fn storage(&mut self, _address: PQAddress, _index: U256) -> Result<U256, Self::Error> {
         Ok(U256::ZERO)
+    }
+
+    fn has_storage(&mut self, _address: PQAddress) -> Result<bool, Self::Error> {
+        Ok(false)
     }
 
     fn block_hash(&mut self, _number: u64) -> Result<alloy_primitives::B256, Self::Error> {
@@ -1401,6 +1440,7 @@ mod tests {
     use alloy_primitives::Bytes;
     use pqcrypto_dilithium::dilithium3;
     use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
+    use pqvm_state::PqvmState;
 
     fn env() -> Env {
         Env {
@@ -1801,6 +1841,41 @@ mod tests {
         let new_addr = u256_to_pqaddress(new_addr_u256);
         // New account should have been created
         assert!(state.account_ref(new_addr).is_some());
+        assert_eq!(state.account_ref(creator).unwrap().nonce, 1);
+    }
+
+    #[test]
+    fn create_rejects_initialized_target_storage() {
+        let mut state = PqvmState::default();
+        let creator = PQAddress([0x12; 32]);
+        state.insert_account(creator, AccountInfo::default());
+        let target = create_address(creator, 0);
+        state.insert_account(target, AccountInfo::default());
+        state.set_storage(target, U256::from(1), U256::from(1));
+
+        let initcode = vec![0x60, 0x00, 0x60, 0x00, 0xf3];
+        let init_len = initcode.len() as u8;
+        let ctx = FrameContext {
+            code: vec![
+                0x60, init_len, 0x60, 0x00, 0x60, 0x00, 0x37, 0x60, init_len, 0x60, 0x00, 0x60,
+                0x00, 0xf0, 0x00,
+            ],
+            calldata: Bytes::from(initcode),
+            caller: PQAddress::zero(),
+            address: creator,
+            value: U256::ZERO,
+            origin: PQAddress::zero(),
+            is_static: false,
+            depth: 0,
+            gas_limit: 5_000_000,
+        };
+
+        let err = Interpreter::default()
+            .execute_frame(&mut state, &env(), &ctx)
+            .unwrap_err();
+
+        assert!(matches!(err, InterpreterError::CreateCollision(addr) if addr == target));
+        assert_eq!(state.account_ref(creator).unwrap().nonce, 0);
     }
 
     #[test]
