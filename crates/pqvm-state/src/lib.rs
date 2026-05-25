@@ -26,6 +26,8 @@ pub trait PqvmDatabase {
 
     fn storage(&mut self, address: PQAddress, index: U256) -> Result<U256, Self::Error>;
 
+    fn has_storage(&mut self, address: PQAddress) -> Result<bool, Self::Error>;
+
     fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error>;
 
     // ── writes ─────────────────────────────────────────────────────────────
@@ -171,6 +173,12 @@ impl PqvmState {
         self.block_hashes.insert(number, hash);
     }
 
+    pub fn has_storage(&self, address: PQAddress) -> bool {
+        self.storage
+            .keys()
+            .any(|(storage_address, _)| *storage_address == address)
+    }
+
     pub fn checkpoint(&mut self) -> usize {
         let id = self.checkpoints.len();
         self.checkpoints.push(StateSnapshot {
@@ -246,6 +254,10 @@ impl PqvmDatabase for PqvmState {
             .get(&(address, index))
             .copied()
             .unwrap_or_default())
+    }
+
+    fn has_storage(&mut self, address: PQAddress) -> Result<bool, StateError> {
+        Ok(PqvmState::has_storage(self, address))
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, StateError> {

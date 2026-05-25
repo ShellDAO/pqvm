@@ -95,6 +95,8 @@ fn gas_constants_match_pqvm_1() {
     assert_eq!(gas::BLOCK_GAS_LIMIT, 50_000_000);
     assert_eq!(gas::MAX_TX_PER_BLOCK, 500);
     assert_eq!(gas::INTRINSIC_GAS_TX, 21_000);
+    assert_eq!(gas::TX_DATA_ZERO_GAS, 4);
+    assert_eq!(gas::TX_DATA_NON_ZERO_GAS, 16);
     assert_eq!(gas::ML_DSA_65_VERIFY_GAS, 46_000);
     assert_eq!(gas::SLH_DSA_SHA2_256F_VERIFY_GAS, 2_300_000);
     assert_eq!(gas::ML_DSA_65_BATCH_VERIFY_GAS_PER_SIG, 12_000);
@@ -173,6 +175,10 @@ impl PqvmDatabase for EmptyDb {
 
     fn storage(&mut self, _address: PQAddress, _index: U256) -> Result<U256, Self::Error> {
         Ok(U256::ZERO)
+    }
+
+    fn has_storage(&mut self, _address: PQAddress) -> Result<bool, Self::Error> {
+        Ok(false)
     }
 
     fn block_hash(&mut self, _number: u64) -> Result<alloy_primitives::B256, Self::Error> {

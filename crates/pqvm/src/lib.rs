@@ -45,12 +45,18 @@ pub enum TxExecutionError {
     UnknownSignatureAlgorithm(u8),
     #[error("sender nonce mismatch: expected {expected}, got {got}")]
     NonceMismatch { expected: u64, got: u64 },
+    #[error("transaction intrinsic gas {required} exceeds gas limit {limit}")]
+    IntrinsicGasTooHigh { required: u64, limit: u64 },
     #[error("sender balance {balance} is below value {value}")]
     InsufficientBalance { balance: U256, value: U256 },
+    #[error("sender balance {balance} is below required amount {required}")]
+    InsufficientFunds { balance: U256, required: U256 },
     #[error("transaction signature is invalid")]
     InvalidSignature,
     #[error("signature verification precompile failed: {0}")]
     SignaturePrecompile(String),
+    #[error("transaction gas accounting overflowed")]
+    GasAccountingOverflow,
     #[error(transparent)]
     State(#[from] StateError),
     #[error(transparent)]
@@ -144,91 +150,169 @@ pub fn execute_transaction(
     }
 
     let sender = derive_sender(tx)?;
-    verify_transaction_signature(tx)?;
+    let intrinsic_gas = intrinsic_gas(tx);
+    if tx.gas_limit < intrinsic_gas {
+        return Err(TxExecutionError::IntrinsicGasTooHigh {
+            required: intrinsic_gas,
+            limit: tx.gas_limit,
+        });
+    }
+    let gas_after_intrinsic = tx.gas_limit - intrinsic_gas;
+    let signature_gas_used = verify_transaction_signature(tx, gas_after_intrinsic)?;
+    let execution_gas_limit = gas_after_intrinsic
+        .checked_sub(signature_gas_used)
+        .ok_or(TxExecutionError::GasAccountingOverflow)?;
+
     let checkpoint = state.checkpoint();
-    ensure_sender_account(state, sender, tx)?;
-    validate_sender_account(state, sender, tx)?;
+    let result = (|| -> Result<TxReceipt, TxExecutionError> {
+        ensure_sender_account(state, sender, tx)?;
+        validate_sender_account(state, sender, tx)?;
 
-    if let Some(to) = tx.to {
-        state.transfer(sender, to, tx.value)?;
-    }
+        let max_fee_charge = fee_for_gas(tx.max_fee, tx.gas_limit)?;
+        deduct_balance(state, sender, max_fee_charge)?;
+        state.increment_nonce(sender)?;
 
-    fn verify_transaction_signature(tx: &PQTx) -> Result<(), TxExecutionError> {
-        let public_key = tx
-            .public_key
-            .as_ref()
-            .ok_or(TxExecutionError::MissingPublicKey)?;
-        let precompile = match AlgoId::try_from(tx.sig_type)
-            .map_err(|_| TxExecutionError::UnknownSignatureAlgorithm(tx.sig_type))?
-        {
-            AlgoId::MlDsa65 => ML_DSA_65_VERIFY,
-            AlgoId::SlhDsaSha2256f => SLH_DSA_SHA2_256F_VERIFY,
+        if let Some(to) = tx.to {
+            state.transfer(sender, to, tx.value)?;
+        }
+
+        // Load the callee code from state; use tx.data as calldata.
+        // For contract creation (tx.to == None), tx.data is the initcode.
+        let (code, calldata) = if let Some(to) = tx.to {
+            let acct_code = state
+                .account_ref(to)
+                .map(|a| a.code.to_vec())
+                .unwrap_or_default();
+            (acct_code, tx.data.clone())
+        } else {
+            // CREATE: initcode = tx.data; calldata is empty
+            (tx.data.to_vec(), alloy_primitives::Bytes::new())
         };
-        let mut input = Vec::with_capacity(public_key.len() + tx.signature.len() + 32);
-        input.extend_from_slice(public_key);
-        input.extend_from_slice(&tx.signature);
-        input.extend_from_slice(tx.signing_payload().as_slice());
-        let output = precompiles::BasicPqPrecompiles
-            .execute(precompile, &input, u64::MAX)
-            .map_err(|err| TxExecutionError::SignaturePrecompile(err.to_string()))?
-            .ok_or_else(|| TxExecutionError::SignaturePrecompile("missing verifier".into()))?;
-        if output.output.first().copied() != Some(1) {
-            return Err(TxExecutionError::InvalidSignature);
-        }
-        Ok(())
+
+        let sender_origin = sender;
+        let ctx = FrameContext {
+            code,
+            calldata,
+            caller: sender,
+            address: tx.to.unwrap_or_else(|| {
+                // Derive CREATE address from sender + nonce (nonce already incremented).
+                let nonce = state.account_ref(sender).map_or(1u64, |a| a.nonce);
+                create_address_from_nonce(sender, nonce.saturating_sub(1))
+            }),
+            value: tx.value,
+            origin: sender_origin,
+            is_static: false,
+            depth: 0,
+            gas_limit: execution_gas_limit,
+        };
+
+        let mut interpreter = Interpreter::default();
+        let result = interpreter.execute_frame(state, env, &ctx)?;
+        let total_gas_used = checked_add_gas(intrinsic_gas, signature_gas_used)?;
+        let total_gas_used = checked_add_gas(total_gas_used, result.gas_used)?;
+        let unused_gas = tx.gas_limit.saturating_sub(total_gas_used);
+        let refund = fee_for_gas(tx.max_fee, unused_gas)?;
+        credit_balance(state, sender, refund)?;
+
+        let state_diff = state.diff_from_checkpoint(checkpoint)?;
+        state.discard_checkpoint(checkpoint)?;
+
+        Ok(TxReceipt {
+            sender,
+            status: result.status,
+            gas_used: total_gas_used,
+            output: result.output,
+            logs: result.logs,
+            state_diff,
+        })
+    })();
+
+    if result.is_err() {
+        let _ = state.revert_to_checkpoint(checkpoint);
     }
-    state.increment_nonce(sender)?;
 
-    // Load the callee code from state; use tx.data as calldata.
-    // For contract creation (tx.to == None), tx.data is the initcode.
-    let (code, calldata) = if let Some(to) = tx.to {
-        let acct_code = state
-            .account_ref(to)
-            .map(|a| a.code.to_vec())
-            .unwrap_or_default();
-        (acct_code, tx.data.clone())
-    } else {
-        // CREATE: initcode = tx.data; calldata is empty
-        (tx.data.to_vec(), alloy_primitives::Bytes::new())
+    result
+}
+
+fn verify_transaction_signature(tx: &PQTx, gas_limit: u64) -> Result<u64, TxExecutionError> {
+    let public_key = tx
+        .public_key
+        .as_ref()
+        .ok_or(TxExecutionError::MissingPublicKey)?;
+    let precompile = match AlgoId::try_from(tx.sig_type)
+        .map_err(|_| TxExecutionError::UnknownSignatureAlgorithm(tx.sig_type))?
+    {
+        AlgoId::MlDsa65 => ML_DSA_65_VERIFY,
+        AlgoId::SlhDsaSha2256f => SLH_DSA_SHA2_256F_VERIFY,
     };
+    let mut input = Vec::with_capacity(public_key.len() + tx.signature.len() + 32);
+    input.extend_from_slice(public_key);
+    input.extend_from_slice(&tx.signature);
+    input.extend_from_slice(tx.signing_payload().as_slice());
+    let output = precompiles::BasicPqPrecompiles
+        .execute(precompile, &input, gas_limit)
+        .map_err(|err| TxExecutionError::SignaturePrecompile(err.to_string()))?
+        .ok_or_else(|| TxExecutionError::SignaturePrecompile("missing verifier".into()))?;
+    if output.output.first().copied() != Some(1) {
+        return Err(TxExecutionError::InvalidSignature);
+    }
+    Ok(output.gas_used)
+}
 
-    let sender_origin = sender;
-    let ctx = FrameContext {
-        code,
-        calldata,
-        caller: sender,
-        address: tx.to.unwrap_or_else(|| {
-            // Derive CREATE address from sender + nonce (nonce already incremented).
-            let nonce = state.account_ref(sender).map_or(1u64, |a| a.nonce);
-            create_address_from_nonce(sender, nonce.saturating_sub(1))
-        }),
-        value: tx.value,
-        origin: sender_origin,
-        is_static: false,
-        depth: 0,
-        gas_limit: tx.gas_limit.min(env.gas_limit),
-    };
-
-    let mut interpreter = Interpreter::default();
-    let result = match interpreter.execute_frame(state, env, &ctx) {
-        Ok(result) => result,
-        Err(err) => {
-            state.revert_to_checkpoint(checkpoint)?;
-            return Err(TxExecutionError::Interpreter(err));
-        }
-    };
-
-    let state_diff = state.diff_from_checkpoint(checkpoint)?;
-    state.discard_checkpoint(checkpoint)?;
-
-    Ok(TxReceipt {
-        sender,
-        status: result.status,
-        gas_used: result.gas_used,
-        output: result.output,
-        logs: result.logs,
-        state_diff,
+fn intrinsic_gas(tx: &PQTx) -> u64 {
+    tx.data.iter().fold(gas::INTRINSIC_GAS_TX, |total, byte| {
+        total.saturating_add(if *byte == 0 {
+            gas::TX_DATA_ZERO_GAS
+        } else {
+            gas::TX_DATA_NON_ZERO_GAS
+        })
     })
+}
+
+fn checked_add_gas(lhs: u64, rhs: u64) -> Result<u64, TxExecutionError> {
+    lhs.checked_add(rhs)
+        .ok_or(TxExecutionError::GasAccountingOverflow)
+}
+
+fn fee_for_gas(max_fee: U256, gas: u64) -> Result<U256, TxExecutionError> {
+    let (amount, overflow) = max_fee.overflowing_mul(U256::from(gas));
+    if overflow {
+        return Err(TxExecutionError::GasAccountingOverflow);
+    }
+    Ok(amount)
+}
+
+fn deduct_balance(
+    state: &mut PqvmState,
+    address: PQAddress,
+    amount: U256,
+) -> Result<(), TxExecutionError> {
+    let account = state
+        .account_mut(address)
+        .ok_or(StateError::MissingAccount(address))?;
+    if account.balance < amount {
+        return Err(TxExecutionError::InsufficientFunds {
+            balance: account.balance,
+            required: amount,
+        });
+    }
+    account.balance -= amount;
+    Ok(())
+}
+
+fn credit_balance(
+    state: &mut PqvmState,
+    address: PQAddress,
+    amount: U256,
+) -> Result<(), TxExecutionError> {
+    if amount.is_zero() {
+        return Ok(());
+    }
+    let account = state
+        .account_mut(address)
+        .ok_or(StateError::MissingAccount(address))?;
+    account.balance += amount;
+    Ok(())
 }
 
 fn derive_sender(tx: &PQTx) -> Result<PQAddress, TxExecutionError> {
@@ -281,10 +365,15 @@ fn validate_sender_account(
             got: tx.nonce,
         });
     }
-    if account.balance < tx.value {
-        return Err(TxExecutionError::InsufficientBalance {
+    let required = fee_for_gas(tx.max_fee, tx.gas_limit)?;
+    let (required, overflow) = tx.value.overflowing_add(required);
+    if overflow {
+        return Err(TxExecutionError::GasAccountingOverflow);
+    }
+    if account.balance < required {
+        return Err(TxExecutionError::InsufficientFunds {
             balance: account.balance,
-            value: tx.value,
+            required,
         });
     }
     Ok(())
@@ -324,13 +413,19 @@ mod tests {
         }
     }
 
-    fn make_tx(value: u64, data: &[u8], to: Option<PQAddress>) -> PQTx {
+    fn make_tx_with_gas(
+        value: u64,
+        data: &[u8],
+        to: Option<PQAddress>,
+        max_fee: U256,
+        gas_limit: u64,
+    ) -> PQTx {
         let (pk, sk) = dilithium3::keypair();
         let mut tx = PQTx {
             chain_id: 1,
             nonce: 0,
-            max_fee: U256::ZERO,
-            gas_limit: gas::BLOCK_GAS_LIMIT,
+            max_fee,
+            gas_limit,
             to,
             value: U256::from(value),
             data: Bytes::copy_from_slice(data),
@@ -341,6 +436,10 @@ mod tests {
         let signature = dilithium3::detached_sign(tx.signing_payload().as_slice(), &sk);
         tx.signature = Bytes::copy_from_slice(signature.as_bytes());
         tx
+    }
+
+    fn make_tx(value: u64, data: &[u8], to: Option<PQAddress>) -> PQTx {
+        make_tx_with_gas(value, data, to, U256::ZERO, gas::BLOCK_GAS_LIMIT)
     }
 
     fn tx_with_keypair(value: u64, data: &[u8]) -> PQTx {
@@ -427,6 +526,78 @@ mod tests {
         let err = execute_transaction(&mut state, &env(), &tx).unwrap_err();
 
         assert!(matches!(err, TxExecutionError::InvalidSignature));
+    }
+
+    #[test]
+    fn execute_transaction_charges_intrinsic_gas_and_refunds_unused_fee() {
+        let mut state = PqvmState::default();
+        let tx = make_tx_with_gas(
+            0,
+            &[0x00, 0x01],
+            Some(PQAddress([0x22; 32])),
+            U256::from(2),
+            100_000,
+        );
+        let sender = PQAddress::derive(tx.sig_type, tx.public_key.as_ref().unwrap());
+        state.insert_account(
+            sender,
+            AccountInfo {
+                balance: U256::from(1_000_000),
+                ..Default::default()
+            },
+        );
+
+        let receipt = execute_transaction(&mut state, &env(), &tx).unwrap();
+
+        let expected_gas = gas::INTRINSIC_GAS_TX
+            + gas::TX_DATA_ZERO_GAS
+            + gas::TX_DATA_NON_ZERO_GAS
+            + gas::ML_DSA_65_VERIFY_GAS;
+        assert_eq!(receipt.gas_used, expected_gas);
+        assert_eq!(
+            state.account_ref(sender).unwrap().balance,
+            U256::from(1_000_000 - expected_gas * 2)
+        );
+    }
+
+    #[test]
+    fn execute_transaction_rejects_insufficient_balance_for_max_fee() {
+        let mut state = PqvmState::default();
+        let tx = make_tx_with_gas(0, &[], Some(PQAddress([0x22; 32])), U256::from(1), 100_000);
+        let sender = PQAddress::derive(tx.sig_type, tx.public_key.as_ref().unwrap());
+        state.insert_account(
+            sender,
+            AccountInfo {
+                balance: U256::from(99_999),
+                ..Default::default()
+            },
+        );
+
+        let err = execute_transaction(&mut state, &env(), &tx).unwrap_err();
+
+        assert!(matches!(
+            err,
+            TxExecutionError::InsufficientFunds { balance, required }
+                if balance == U256::from(99_999) && required == U256::from(100_000)
+        ));
+    }
+
+    #[test]
+    fn execute_transaction_limits_signature_gas_to_remaining_budget() {
+        let mut state = PqvmState::default();
+        let tx = make_tx_with_gas(
+            0,
+            &[],
+            Some(PQAddress([0x22; 32])),
+            U256::ZERO,
+            gas::INTRINSIC_GAS_TX + gas::ML_DSA_65_VERIFY_GAS - 1,
+        );
+
+        let err = execute_transaction(&mut state, &env(), &tx).unwrap_err();
+
+        assert!(
+            matches!(err, TxExecutionError::SignaturePrecompile(message) if message.contains("out of gas"))
+        );
     }
 
     #[test]
