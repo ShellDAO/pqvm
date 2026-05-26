@@ -196,7 +196,9 @@ impl PqvmState {
             .ok_or(StateError::InvalidCheckpoint(checkpoint))?;
         self.accounts = snapshot.accounts;
         self.storage = snapshot.storage;
-        self.checkpoints.truncate(checkpoint);
+        // Clear checkpoint snapshots beyond this point to prevent sensitive state leakage.
+        // Any checkpoints after this one are discarded when reverting.
+        self.clear_checkpoints_after(checkpoint);
         Ok(())
     }
 
@@ -204,8 +206,38 @@ impl PqvmState {
         if checkpoint >= self.checkpoints.len() {
             return Err(StateError::InvalidCheckpoint(checkpoint));
         }
-        self.checkpoints.truncate(checkpoint);
+        // Clear checkpoint snapshots at and beyond this point to prevent sensitive state leakage.
+        // These checkpoints are no longer needed and their memory should be cleared.
+        self.clear_checkpoints_at_and_after(checkpoint);
         Ok(())
+    }
+
+    /// Securely clear all checkpoint snapshots at index `checkpoint` and beyond.
+    /// This ensures sensitive state data in discarded checkpoints is zeroed in memory.
+    fn clear_checkpoints_at_and_after(&mut self, checkpoint: usize) {
+        if checkpoint < self.checkpoints.len() {
+            // Explicitly clear each checkpoint to zero sensitive data.
+            for i in checkpoint..self.checkpoints.len() {
+                self.checkpoints[i].accounts.clear();
+                self.checkpoints[i].storage.clear();
+            }
+            // Truncate the vector to remove cleared checkpoints.
+            self.checkpoints.truncate(checkpoint);
+        }
+    }
+
+    /// Securely clear all checkpoint snapshots after index `checkpoint` (exclusive).
+    /// Used when reverting: keep the checkpoint we're reverting to, but clear newer ones.
+    fn clear_checkpoints_after(&mut self, checkpoint: usize) {
+        if checkpoint + 1 < self.checkpoints.len() {
+            // Explicitly clear each checkpoint beyond the one we're keeping.
+            for i in (checkpoint + 1)..self.checkpoints.len() {
+                self.checkpoints[i].accounts.clear();
+                self.checkpoints[i].storage.clear();
+            }
+            // Truncate the vector to remove cleared checkpoints.
+            self.checkpoints.truncate(checkpoint + 1);
+        }
     }
 
     pub fn diff_from_checkpoint(&self, checkpoint: usize) -> Result<StateDiff, StateError> {
