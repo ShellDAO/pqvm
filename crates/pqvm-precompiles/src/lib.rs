@@ -13,7 +13,6 @@ use pqvm_primitives::PQAddress;
 pub const ML_DSA_65_VERIFY: PQAddress = numbered_precompile(1);
 pub const SLH_DSA_SHA2_256F_VERIFY: PQAddress = numbered_precompile(2);
 pub const ML_DSA_65_BATCH_VERIFY: PQAddress = numbered_precompile(3);
-pub const MAX_BATCH_SIGNATURES: usize = 256;
 pub const BLAKE3_256: PQAddress = numbered_precompile(4);
 pub const BLAKE3_512: PQAddress = numbered_precompile(5);
 pub const PQADDRESS_DERIVE: PQAddress = numbered_precompile(6);
@@ -58,9 +57,15 @@ pub enum PrecompileError {
     MissingAlgoId,
     #[error("batch input has trailing bytes")]
     BatchTrailingBytes,
-    #[error("batch input count {count} exceeds max {max}")]
-    BatchTooLarge { count: usize, max: usize },
+    #[error("batch signature count {n_sigs} exceeds maximum {max}")]
+    BatchTooLarge { n_sigs: u32, max: u32 },
+    #[error("gas cost overflow for batch verification")]
+    GasOverflow,
 }
+
+/// Maximum number of signatures allowed in a single batch-verify call.
+/// Enforced before any verification work begins to prevent unbounded CPU use.
+pub const MAX_BATCH_SIGNATURES: u32 = 256;
 
 impl PrecompileSet for BasicPqPrecompiles {
     type Error = PrecompileError;
@@ -99,16 +104,21 @@ impl PrecompileSet for BasicPqPrecompiles {
                 }))
             }
             ML_DSA_65_BATCH_VERIFY => {
-                let count = parse_ml_dsa_65_batch_count(input);
-                if count > MAX_BATCH_SIGNATURES {
+                // Parse the count from the 4-byte header BEFORE doing any verification
+                // work so that gas is charged upfront (prevents free-DoS via OOG revert).
+                let n_sigs = parse_ml_dsa_65_batch_count(input);
+                if n_sigs > MAX_BATCH_SIGNATURES {
                     return Err(PrecompileError::BatchTooLarge {
-                        count,
+                        n_sigs,
                         max: MAX_BATCH_SIGNATURES,
                     });
                 }
-                let gas_used = ML_DSA_65_BATCH_VERIFY_GAS_PER_SIG.saturating_mul(count as u64);
+                let gas_used = ML_DSA_65_BATCH_VERIFY_GAS_PER_SIG
+                    .checked_mul(n_sigs as u64)
+                    .ok_or(PrecompileError::GasOverflow)?;
+                // Charge BEFORE the verification loop.
                 charge(gas_used, gas_limit)?;
-                let valid = verify_ml_dsa_65_batch(input, count)?;
+                let valid = verify_ml_dsa_65_batch(input, n_sigs)?;
                 Ok(Some(PrecompileOutput {
                     gas_used,
                     output: bool_output(valid),
@@ -203,16 +213,16 @@ fn verify_slh_dsa_sha2_256f(input: &[u8]) -> bool {
     sphincssha2256fsimple::verify_detached_signature(&sig, message, &pk).is_ok()
 }
 
-fn parse_ml_dsa_65_batch_count(input: &[u8]) -> usize {
+fn parse_ml_dsa_65_batch_count(input: &[u8]) -> u32 {
     input
         .get(..4)
         .map(|count_bytes| {
-            u32::from_be_bytes(count_bytes.try_into().expect("slice length checked")) as usize
+            u32::from_be_bytes(count_bytes.try_into().expect("slice length checked"))
         })
         .unwrap_or(0)
 }
 
-fn verify_ml_dsa_65_batch(input: &[u8], count: usize) -> Result<bool, PrecompileError> {
+fn verify_ml_dsa_65_batch(input: &[u8], count: u32) -> Result<bool, PrecompileError> {
     if input.len() < 4 {
         return Ok(false);
     }
@@ -359,7 +369,7 @@ mod tests {
         let err = BasicPqPrecompiles
             .execute(
                 ML_DSA_65_BATCH_VERIFY,
-                &(MAX_BATCH_SIGNATURES as u32 + 1).to_be_bytes(),
+                &(MAX_BATCH_SIGNATURES + 1).to_be_bytes(),
                 u64::MAX,
             )
             .unwrap_err();
@@ -367,7 +377,7 @@ mod tests {
         assert_eq!(
             err,
             PrecompileError::BatchTooLarge {
-                count: MAX_BATCH_SIGNATURES + 1,
+                n_sigs: MAX_BATCH_SIGNATURES + 1,
                 max: MAX_BATCH_SIGNATURES,
             }
         );
@@ -399,6 +409,49 @@ mod tests {
             PrecompileError::OutOfGas {
                 required: 36,
                 limit: 1
+            }
+        );
+    }
+
+    /// C-2 regression: gas must be charged BEFORE any verification work.
+    /// With 100 sigs in the header but only 10 gas available, the call must
+    /// return OOG without performing a single verification.
+    #[test]
+    fn batch_verify_oog_before_verification() {
+        // Build a header claiming 100 signatures but provide no actual sig data.
+        // If gas were charged after the loop, the loop would run until it hits
+        // missing data and return Ok(false) — not an error — with no gas charged.
+        let mut input = Vec::new();
+        input.extend_from_slice(&100u32.to_be_bytes()); // n_sigs = 100
+
+        let err = BasicPqPrecompiles
+            .execute(ML_DSA_65_BATCH_VERIFY, &input, 10)
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            PrecompileError::OutOfGas {
+                required: ML_DSA_65_BATCH_VERIFY_GAS_PER_SIG * 100,
+                limit: 10,
+            }
+        );
+    }
+
+    /// C-2 regression: n_sigs above MAX_BATCH_SIGNATURES is rejected upfront.
+    #[test]
+    fn batch_verify_rejects_too_many_sigs() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&257u32.to_be_bytes()); // n_sigs = 257 > 256
+
+        let err = BasicPqPrecompiles
+            .execute(ML_DSA_65_BATCH_VERIFY, &input, u64::MAX)
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            PrecompileError::BatchTooLarge {
+                n_sigs: 257,
+                max: MAX_BATCH_SIGNATURES,
             }
         );
     }
